@@ -1,0 +1,199 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function self(uid) { return signedIn() && request.auth.uid == uid; }
+    function profile() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function approved() { return signedIn() && request.auth.token.email_verified == true && profile().status == 'approved'; }
+    function admin() { return approved() && profile().role == 'admin'; }
+    function finance() { return approved() && profile().role in ['admin', 'executive']; }
+    function ticketAgent() { return approved() && profile().role in ['admin', 'executive', 'member']; }
+    function validMoney(v) { return v is int && v >= 0 && v <= 1000000000000; }
+    function validDate(v) { return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
+
+    match /users/{uid} {
+      allow create: if self(uid)
+        && request.resource.data.keys().hasOnly(['uid','fullName','username','usernameKey','email','role','status','createdAt'])
+        && request.resource.data.uid == uid
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() >= 2
+        && request.resource.data.fullName.size() <= 100
+        && request.resource.data.username is string
+        && request.resource.data.username.matches('^[a-z0-9_-]{3,24}$')
+        && request.resource.data.usernameKey == request.resource.data.username
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role == null
+        && request.resource.data.status == 'pending'
+        && getAfter(/databases/$(database)/documents/usernames/$(request.resource.data.username)).data.uid == uid;
+      allow read: if self(uid) || admin();
+      allow update: if admin() && uid != request.auth.uid
+        && resource.data.isMasterAdmin != true
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role','status','updatedAt'])
+        && (request.resource.data.role in ['admin','executive','member','guest'] || request.resource.data.role == null)
+        && request.resource.data.status in ['approved','rejected','suspended'];
+      allow update: if self(uid)
+        && resource.data.status == 'pending'
+        && resource.data.email == 'carpentersfamily001@gmail.com'
+        && request.auth.token.email == 'carpentersfamily001@gmail.com'
+        && request.auth.token.email_verified == true
+        && !exists(/databases/$(database)/documents/settings/masterAdmin)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role','status','isMasterAdmin','updatedAt'])
+        && request.resource.data.role == 'admin'
+        && request.resource.data.status == 'approved'
+        && request.resource.data.isMasterAdmin == true;
+      allow delete: if false;
+    }
+
+    match /usernames/{username} {
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && request.resource.data.username == username && username.matches('^[a-z0-9_-]{3,24}$')
+        && !exists(/databases/$(database)/documents/usernames/$(username));
+      allow read, update, delete: if false;
+    }
+
+    match /usersPublic/{uid} {
+      allow create: if self(uid)
+        && request.resource.data.uid == uid
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role == null
+        && request.resource.data.status == 'pending'
+        && getAfter(/databases/$(database)/documents/users/$(uid)).data.username == request.resource.data.username;
+      allow read: if admin();
+      allow update: if admin() && uid != request.auth.uid
+        && get(/databases/$(database)/documents/users/$(uid)).data.isMasterAdmin != true
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role','status','updatedAt'])
+        && (request.resource.data.role in ['admin','executive','member','guest'] || request.resource.data.role == null)
+        && request.resource.data.status in ['approved','rejected','suspended'];
+      allow update: if self(uid)
+        && request.auth.token.email == 'carpentersfamily001@gmail.com'
+        && request.auth.token.email_verified == true
+        && !exists(/databases/$(database)/documents/settings/masterAdmin)
+        && request.resource.data.role == 'admin' && request.resource.data.status == 'approved'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role','status','updatedAt']);
+      allow delete: if false;
+    }
+
+    match /ticketTiers/{id} {
+      allow read: if approved();
+      allow create: if admin() && request.resource.data.sold == 0
+        && request.resource.data.capacity is int && request.resource.data.capacity >= 0
+        && validMoney(request.resource.data.price);
+      allow update: if admin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['price','capacity','active','updatedAt'])
+        && validMoney(request.resource.data.price)
+        && request.resource.data.capacity is int && request.resource.data.capacity >= resource.data.sold;
+      allow update: if ticketAgent()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['sold','lastSaleId','updatedAt'])
+        && getAfter(/databases/$(database)/documents/ticketSales/$(request.resource.data.lastSaleId)).data.tierId == id
+        && request.resource.data.sold == resource.data.sold + getAfter(/databases/$(database)/documents/ticketSales/$(request.resource.data.lastSaleId)).data.quantity
+        && request.resource.data.sold <= resource.data.capacity;
+      allow delete: if admin();
+    }
+
+    match /ticketSales/{id} {
+      allow read: if finance();
+      allow create: if ticketAgent()
+        && request.resource.data.keys().hasOnly(['tierId','tierName','quantity','unitPrice','total','status','date','agent','agentId','createdBy','createdAt'])
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.agentId == request.auth.uid
+        && request.resource.data.agent == profile().fullName
+        && request.resource.data.quantity is int && request.resource.data.quantity >= 1 && request.resource.data.quantity <= 20
+        && validMoney(request.resource.data.unitPrice)
+        && request.resource.data.total == request.resource.data.unitPrice * request.resource.data.quantity
+        && request.resource.data.status == 'Paid' && validDate(request.resource.data.date)
+        && exists(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId))
+        && getAfter(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.lastSaleId == id
+        && getAfter(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.sold
+          == get(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.sold + request.resource.data.quantity
+        && getAfter(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.sold <= get(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.capacity
+        && getAfter(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.active != false
+        && request.resource.data.unitPrice == get(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.price;
+      allow update, delete: if false;
+    }
+
+    match /revenues/{id} {
+      allow read: if finance();
+      allow create: if finance() && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.agent == profile().fullName
+        && request.resource.data.title is string && request.resource.data.title.size() >= 1 && request.resource.data.title.size() <= 160
+        && request.resource.data.category is string && request.resource.data.category.size() <= 60
+        && request.resource.data.category != 'Ticket Sales'
+        && validMoney(request.resource.data.amount) && request.resource.data.amount > 0
+        && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date)
+        && request.resource.data.method is string && request.resource.data.method.size() <= 60;
+      allow update: if finance() && (resource.data.createdBy == request.auth.uid || admin())
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['title','category','categoryId','categoryName','amount','status','date','method','updatedBy','updatedAt'])
+        && request.resource.data.title is string && request.resource.data.title.size() >= 1 && request.resource.data.title.size() <= 160
+        && validMoney(request.resource.data.amount) && request.resource.data.amount > 0
+        && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date);
+      allow delete: if finance() && (resource.data.createdBy == request.auth.uid || admin());
+    }
+
+    match /expenses/{id} {
+      allow read: if finance();
+      allow create: if finance() && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.agent == profile().fullName
+        && request.resource.data.title is string && request.resource.data.title.size() >= 1 && request.resource.data.title.size() <= 160
+        && request.resource.data.category is string && request.resource.data.category.size() <= 100
+        && validMoney(request.resource.data.amount) && request.resource.data.amount > 0
+        && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date);
+      allow update: if finance() && (resource.data.createdBy == request.auth.uid || admin())
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['title','category','expenseCategoryId','budgetAllocationId','amount','status','requestedStatus','approvalStatus','date','updatedBy','updatedAt','reviewedBy','reviewedByName','reviewedAt'])
+        && request.resource.data.title is string && request.resource.data.title.size() >= 1 && request.resource.data.title.size() <= 160
+        && validMoney(request.resource.data.amount) && request.resource.data.amount > 0
+        && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date);
+      allow delete: if finance() && (resource.data.createdBy == request.auth.uid || admin());
+    }
+
+    match /revenueCategories/{id} {
+      allow read: if finance();
+      allow create: if admin() && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60
+        && request.resource.data.systemControlled != true;
+      allow update: if admin() && resource.data.systemControlled != true
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','active','updatedAt'])
+        && request.resource.data.name is string && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60;
+      allow delete: if false;
+    }
+    match /expenseCategories/{id} {
+      allow read: if finance();
+      allow create: if admin() && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60;
+      allow update: if admin() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','active','updatedAt'])
+        && request.resource.data.name is string && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60;
+      allow delete: if false;
+    }
+    match /budgetAllocations/{id} {
+      allow read: if finance();
+      allow create, update: if admin() && request.resource.data.category is string && validMoney(request.resource.data.amount);
+      allow delete: if false;
+    }
+    match /budgets/{id} {
+      allow read: if finance();
+      allow write: if admin() && validMoney(request.resource.data.totalAmount);
+    }
+    match /settings/{id} {
+      allow read: if admin();
+      allow create, update: if admin() && id != 'masterAdmin'
+        || (id == 'masterAdmin' && signedIn() && request.auth.token.email == 'carpentersfamily001@gmail.com'
+          && request.auth.token.email_verified == true && request.resource.data.uid == request.auth.uid
+          && !exists(/databases/$(database)/documents/settings/masterAdmin)
+          && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.isMasterAdmin == true
+          && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin');
+      allow delete: if false;
+    }
+    match /activityLogs/{id} {
+      allow read: if admin();
+      allow create: if signedIn() && request.resource.data.actorId == request.auth.uid
+        && request.resource.data.actor is string && request.resource.data.action is string
+        && request.resource.data.label is string
+        && (request.resource.data.action == 'user.signup' || approved());
+      allow update, delete: if false;
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
