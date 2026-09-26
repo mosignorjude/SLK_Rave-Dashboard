@@ -191,7 +191,14 @@ service cloud.firestore {
       allow create: if signedIn() && request.resource.data.actorId == request.auth.uid
         && request.resource.data.actor is string && request.resource.data.action is string
         && request.resource.data.label is string
-        && (request.resource.data.action == 'user.signup' || approved());
+        && (request.resource.data.action == 'user.signup' || approved()
+          || (request.resource.data.action == 'user.master_admin_claimed'
+            && request.auth.token.email == 'carpentersfamily001@gmail.com'
+            && request.auth.token.email_verified == true
+            && getAfter(/databases/$(database)/documents/settings/masterAdmin).data.uid == request.auth.uid
+            && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.isMasterAdmin == true
+            && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+            && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'approved'));
       allow update, delete: if false;
     }
     match /{document=**} { allow read, write: if false; }
