@@ -6,9 +6,9 @@ These rules are designed for the Spark architecture: Firebase Authentication plu
 
 - Every active role requires a signed-in user with a verified email and an approved Firestore profile.
 - A user may create only their own pending profile and username. The Master Admin role can be claimed only by the verified `carpentersfamily001@gmail.com` account while the bootstrap marker does not exist.
-- Only Admins can approve accounts, change roles, configure tickets and budgets, and manage categories. The Master Admin profile and marker cannot be changed through the browser after bootstrap.
+- Only Admins can approve accounts, change roles, configure tickets and budgets, and manage categories. Budget categories store a percentage and whole-Naira amount; the browser validates that their amounts do not exceed the budget total. The Master Admin profile and marker cannot be changed through the browser after bootstrap.
 - Admins and Executives can access finance ledgers. Members can create ticket sales; sales must use the current tier price and atomically match the inventory increment. Sales cannot be edited or deleted.
-- Guests can read ticket tiers and budget allocations. They cannot read transaction ledgers or team profiles.
+- Guests can read ticket tiers. Admins and Executives can read budgets and allocations; only Admins can create, update, or remove them. Guests cannot read transaction ledgers or team profiles.
 - Activity entries are append-only and tied to the signed-in actor. Only Admins can read the audit collection.
 - The final catch-all rule denies all unspecified reads and writes.
 

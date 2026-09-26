@@ -6,3 +6,16 @@ dist/
 !.env.example
 .firebase/
 *.log
+
+# Firebase local configuration and generated credentials
+.runtimeconfig.json
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+*-firebase-adminsdk-*.json
+service-account*.json
+*service-account*.json
+
+# Private key material
+*.pem
+*.key

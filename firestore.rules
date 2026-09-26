@@ -22,6 +22,7 @@ service cloud.firestore {
         && request.resource.data.username.matches('^[a-z0-9_-]{3,24}$')
         && request.resource.data.usernameKey == request.resource.data.username
         && request.resource.data.email == request.auth.token.email
+        && request.resource.data.createdAt is timestamp
         && request.resource.data.role == null
         && request.resource.data.status == 'pending'
         && getAfter(/databases/$(database)/documents/usernames/$(request.resource.data.username)).data.uid == uid;
@@ -45,8 +46,11 @@ service cloud.firestore {
     }
 
     match /usernames/{username} {
-      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid','username','createdAt'])
+        && request.resource.data.uid == request.auth.uid
         && request.resource.data.username == username && username.matches('^[a-z0-9_-]{3,24}$')
+        && request.resource.data.createdAt is timestamp
         && !exists(/databases/$(database)/documents/usernames/$(username));
       allow read, update, delete: if false;
     }
@@ -57,6 +61,11 @@ service cloud.firestore {
         && request.resource.data.email == request.auth.token.email
         && request.resource.data.role == null
         && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.keys().hasOnly(['uid','fullName','username','email','role','status','createdAt'])
+        && request.resource.data.fullName is string && request.resource.data.fullName.size() >= 2 && request.resource.data.fullName.size() <= 100
+        && request.resource.data.username is string && request.resource.data.username.matches('^[a-z0-9_-]{3,24}$')
+        && request.resource.data.createdAt is timestamp
         && getAfter(/databases/$(database)/documents/users/$(uid)).data.username == request.resource.data.username;
       allow read: if admin();
       allow update: if admin() && uid != request.auth.uid
@@ -94,6 +103,8 @@ service cloud.firestore {
       allow read: if finance();
       allow create: if ticketAgent()
         && request.resource.data.keys().hasOnly(['tierId','tierName','quantity','unitPrice','total','status','date','agent','agentId','createdBy','createdAt'])
+        && request.resource.data.tierId is string
+        && request.resource.data.tierName is string && request.resource.data.tierName.size() >= 1 && request.resource.data.tierName.size() <= 80
         && request.resource.data.createdBy == request.auth.uid
         && request.resource.data.agentId == request.auth.uid
         && request.resource.data.agent == profile().fullName
@@ -101,6 +112,7 @@ service cloud.firestore {
         && validMoney(request.resource.data.unitPrice)
         && request.resource.data.total == request.resource.data.unitPrice * request.resource.data.quantity
         && request.resource.data.status == 'Paid' && validDate(request.resource.data.date)
+        && request.resource.data.createdAt is timestamp
         && exists(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId))
         && getAfter(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.lastSaleId == id
         && getAfter(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.sold
@@ -114,38 +126,59 @@ service cloud.firestore {
     match /revenues/{id} {
       allow read: if finance();
       allow create: if finance() && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.keys().hasOnly(['title','category','categoryId','budgetAllocationId','amount','status','date','method','agent','createdBy','updatedBy','updatedAt','createdAt'])
         && request.resource.data.agent == profile().fullName
         && request.resource.data.title is string && request.resource.data.title.size() >= 1 && request.resource.data.title.size() <= 160
         && request.resource.data.category is string && request.resource.data.category.size() <= 60
         && request.resource.data.category != 'Ticket Sales'
         && validMoney(request.resource.data.amount) && request.resource.data.amount > 0
         && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date)
-        && request.resource.data.method is string && request.resource.data.method.size() <= 60;
+        && request.resource.data.method is string && request.resource.data.method.size() <= 60
+        && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.updatedAt is timestamp && request.resource.data.createdAt is timestamp;
       allow update: if finance() && (resource.data.createdBy == request.auth.uid || admin())
         && request.resource.data.createdBy == resource.data.createdBy
         && request.resource.data.updatedBy == request.auth.uid
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['title','category','categoryId','categoryName','amount','status','date','method','updatedBy','updatedAt'])
         && request.resource.data.title is string && request.resource.data.title.size() >= 1 && request.resource.data.title.size() <= 160
+        && request.resource.data.category is string && request.resource.data.category.size() >= 1 && request.resource.data.category.size() <= 60
         && validMoney(request.resource.data.amount) && request.resource.data.amount > 0
-        && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date);
+        && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date)
+        && request.resource.data.method is string && request.resource.data.method.size() <= 60
+        && request.resource.data.updatedAt is timestamp;
       allow delete: if finance() && (resource.data.createdBy == request.auth.uid || admin());
     }
 
     match /expenses/{id} {
       allow read: if finance();
       allow create: if finance() && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.keys().hasOnly(['title','category','amount','status','date','method','agent','createdBy','updatedBy','updatedAt','createdAt'])
         && request.resource.data.agent == profile().fullName
         && request.resource.data.title is string && request.resource.data.title.size() >= 1 && request.resource.data.title.size() <= 160
-        && request.resource.data.category is string && request.resource.data.category.size() <= 100
+        && request.resource.data.category is string && request.resource.data.category.size() >= 1 && request.resource.data.category.size() <= 100
+        && (!request.resource.data.keys().hasAny(['budgetAllocationId']) || request.resource.data.budgetAllocationId == null
+          || (exists(/databases/$(database)/documents/budgetAllocations/$(request.resource.data.budgetAllocationId))
+            && get(/databases/$(database)/documents/budgetAllocations/$(request.resource.data.budgetAllocationId)).data.category == request.resource.data.category))
+        && request.resource.data.method is string && request.resource.data.method.size() <= 60
         && validMoney(request.resource.data.amount) && request.resource.data.amount > 0
-        && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date);
+        && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date)
+        && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.updatedAt is timestamp && request.resource.data.createdAt is timestamp;
       allow update: if finance() && (resource.data.createdBy == request.auth.uid || admin())
         && request.resource.data.createdBy == resource.data.createdBy
         && request.resource.data.updatedBy == request.auth.uid
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['title','category','expenseCategoryId','budgetAllocationId','amount','status','requestedStatus','approvalStatus','date','updatedBy','updatedAt','reviewedBy','reviewedByName','reviewedAt'])
         && request.resource.data.title is string && request.resource.data.title.size() >= 1 && request.resource.data.title.size() <= 160
+        && request.resource.data.category is string && request.resource.data.category.size() >= 1 && request.resource.data.category.size() <= 100
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['budgetAllocationId']) || request.resource.data.budgetAllocationId == null
+          || (exists(/databases/$(database)/documents/budgetAllocations/$(request.resource.data.budgetAllocationId))
+            && get(/databases/$(database)/documents/budgetAllocations/$(request.resource.data.budgetAllocationId)).data.category == request.resource.data.category))
         && validMoney(request.resource.data.amount) && request.resource.data.amount > 0
-        && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date);
+        && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date)
+        && ( !request.resource.data.diff(resource.data).affectedKeys().hasAny(['reviewedBy']) || request.resource.data.reviewedBy == request.auth.uid )
+        && ( !request.resource.data.diff(resource.data).affectedKeys().hasAny(['reviewedByName']) || request.resource.data.reviewedByName == profile().fullName )
+        && ( !request.resource.data.diff(resource.data).affectedKeys().hasAny(['approvalStatus']) || request.resource.data.approvalStatus in ['approved','rejected'] )
+        && request.resource.data.updatedAt is timestamp;
       allow delete: if finance() && (resource.data.createdBy == request.auth.uid || admin());
     }
 
@@ -169,12 +202,41 @@ service cloud.firestore {
     }
     match /budgetAllocations/{id} {
       allow read: if finance();
-      allow create, update: if admin() && request.resource.data.category is string && validMoney(request.resource.data.amount);
-      allow delete: if false;
+      allow create: if admin()
+        && request.resource.data.keys().hasOnly(['budgetId','categoryId','category','percent','amount','createdAt','updatedAt'])
+        && request.resource.data.budgetId == 'event-2026'
+        && request.resource.data.category is string
+        && request.resource.data.category.size() >= 2 && request.resource.data.category.size() <= 100
+        && (!request.resource.data.keys().hasAny(['categoryId']) || (request.resource.data.categoryId is string && request.resource.data.categoryId.size() <= 100))
+        && request.resource.data.percent is number && request.resource.data.percent >= 0 && request.resource.data.percent <= 100
+        && validMoney(request.resource.data.amount)
+        && request.resource.data.createdAt is timestamp && request.resource.data.updatedAt is timestamp;
+      allow update: if admin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['budgetId','categoryId','category','percent','amount','updatedAt'])
+        && request.resource.data.budgetId == 'event-2026'
+        && request.resource.data.category is string
+        && request.resource.data.category.size() >= 2 && request.resource.data.category.size() <= 100
+        && (!request.resource.data.keys().hasAny(['categoryId']) || (request.resource.data.categoryId is string && request.resource.data.categoryId.size() <= 100))
+        && request.resource.data.percent is number && request.resource.data.percent >= 0 && request.resource.data.percent <= 100
+        && validMoney(request.resource.data.amount)
+        && request.resource.data.updatedAt is timestamp;
+      allow delete: if admin();
     }
     match /budgets/{id} {
       allow read: if finance();
-      allow write: if admin() && validMoney(request.resource.data.totalAmount);
+      allow create: if admin()
+        && id == 'event-2026'
+        && request.resource.data.keys().hasOnly(['name','totalAmount','year','createdAt','updatedAt'])
+        && request.resource.data.name is string && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 100
+        && validMoney(request.resource.data.totalAmount) && request.resource.data.totalAmount > 0
+        && request.resource.data.year is int
+        && request.resource.data.createdAt is timestamp && request.resource.data.updatedAt is timestamp;
+      allow update: if admin()
+        && id == 'event-2026'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','totalAmount','year','updatedAt'])
+        && request.resource.data.name is string && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 100
+        && validMoney(request.resource.data.totalAmount) && request.resource.data.totalAmount > 0
+        && request.resource.data.year is int && request.resource.data.updatedAt is timestamp;
     }
     match /settings/{id} {
       allow read: if admin();
@@ -189,9 +251,19 @@ service cloud.firestore {
     match /activityLogs/{id} {
       allow read: if admin();
       allow create: if signedIn() && request.resource.data.actorId == request.auth.uid
-        && request.resource.data.actor is string && request.resource.data.action is string
-        && request.resource.data.label is string
-        && (request.resource.data.action == 'user.signup' || approved()
+        && request.resource.data.keys().hasOnly(['actor','actorId','action','label','createdAt'])
+        && request.resource.data.actor is string && request.resource.data.actor.size() >= 1 && request.resource.data.actor.size() <= 100
+        && request.resource.data.action is string && request.resource.data.action.size() >= 1 && request.resource.data.action.size() <= 60
+        && request.resource.data.label is string && request.resource.data.label.size() >= 1 && request.resource.data.label.size() <= 240
+        && request.resource.data.createdAt is timestamp
+        && ((approved() && request.resource.data.action != 'user.signup'
+            && request.resource.data.action != 'user.master_admin_claimed')
+          || (request.resource.data.action == 'user.signup'
+          && !exists(/databases/$(database)/documents/users/$(request.auth.uid))
+          && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.uid == request.auth.uid
+          && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.email == request.auth.token.email
+          && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.status == 'pending'
+          && request.resource.data.actor == getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.fullName)
           || (request.resource.data.action == 'user.master_admin_claimed'
             && request.auth.token.email == 'carpentersfamily001@gmail.com'
             && request.auth.token.email_verified == true

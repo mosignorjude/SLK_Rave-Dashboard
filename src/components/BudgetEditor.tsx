@@ -1,12 +1,98 @@
-import {useState,type FormEvent} from 'react';
+import {useMemo,useState,type FormEvent} from 'react';
 import {doc,runTransaction,serverTimestamp} from 'firebase/firestore';
+import {Plus,Trash2,X} from 'lucide-react';
 import type {Allocation} from '../types';
 import {db} from '../firebase';
 import {formatNaira,parseNaira} from '../money';
+import {notifyError,userFacingError} from '../errorHandling';
 
-export default function BudgetEditor({allocations,total,onClose,ping}:{allocations:Allocation[];total:number;onClose:()=>void;ping:(message:string)=>void}){
-  const [rows,setRows]=useState(allocations.map(x=>({id:x.id,category:x.category,amount:String(x.amount)})));
-  const [budget,setBudget]=useState(String(total));const [busy,setBusy]=useState(false);
-  async function save(e:FormEvent){e.preventDefault();if(!db)return;const firestore=db;setBusy(true);try{const amount=parseNaira(budget);const next=rows.map(x=>({id:x.id,amount:parseNaira(x.amount)}));if(next.reduce((n,x)=>n+x.amount,0)!==amount)throw new Error('Allocations must add up exactly to the total budget.');await runTransaction(firestore,async tx=>{const refs=next.map(x=>doc(firestore,'budgetAllocations',x.id)),snapshots=await Promise.all(refs.map(ref=>tx.get(ref)));if(snapshots.some(s=>!s.exists()))throw new Error('Budget allocation is missing.');next.forEach((x,i)=>tx.update(refs[i],{amount:x.amount,updatedAt:serverTimestamp()}));tx.set(doc(firestore,'budgets','event-2026'),{name:'SLK Rave 2026',totalAmount:amount,year:2026,updatedAt:serverTimestamp()},{merge:true})});ping('Budget updated.');onClose();}catch(e:any){ping(e.message||'Could not update the budget.');}finally{setBusy(false)}}
-  return <div className="modal-overlay" onClick={onClose}><div className="modal" onClick={e=>e.stopPropagation()}><div className="modal-head"><div><div className="eyebrow">ADMIN CONTROLS</div><h2>Edit event budget</h2></div><button className="icon-button" type="button" onClick={onClose}>×</button></div><form onSubmit={save}><div className="modal-body"><label>Total budget (₦)<input type="number" min="0" step="1" value={budget} onChange={e=>setBudget(e.target.value)} required/></label>{rows.map((row,i)=><label key={row.id}>{row.category}<input type="number" min="0" step="1" value={row.amount} onChange={e=>setRows(old=>old.map((x,j)=>j===i?{...x,amount:e.target.value}:x))} required/></label>)}<div className="callout"><span>Finance users should review paid expenses against category allocations before confirming payment.</span></div><div className="callout"><span>Current allocation total: <b>{formatNaira(rows.reduce((n,x)=>n+(Number(x.amount)||0),0))}</b></span></div></div><div className="modal-foot"><button type="button" className="btn secondary" onClick={onClose}>Cancel</button><button disabled={busy} className="btn primary">{busy?'Saving…':'Save budget'}</button></div></form></div></div>
+type Row={id:string;category:string;percent:string;amount:string};
+const BUDGET_ID='event-2026';
+
+export default function BudgetEditor({allocations,total,budgetName,budgetExists,initialAdd=false,onClose,ping}:{allocations:Allocation[];total:number;budgetName:string;budgetExists:boolean;initialAdd?:boolean;onClose:()=>void;ping:(message:string)=>void}){
+  const [rows,setRows]=useState<Row[]>(()=>{
+    const current=allocations.map(x=>({id:x.id,category:x.category,percent:String(Number.isFinite(x.percent)?x.percent:(total?Number((x.amount/total*100).toFixed(2)):0)),amount:String(x.amount)}));
+    return initialAdd&&budgetExists?[...current,{id:crypto.randomUUID(),category:'',percent:'',amount:''}]:current;
+  });
+  const [budget,setBudget]=useState(String(total||''));
+  const [name,setName]=useState(budgetName||'SLK Rave 2026');
+  const [busy,setBusy]=useState(false);
+  const allocated=useMemo(()=>rows.reduce((sum,row)=>sum+(Number(row.amount)||0),0),[rows]);
+  const percentage=useMemo(()=>rows.reduce((sum,row)=>sum+(Number(row.percent)||0),0),[rows]);
+  const totalAmount=Number(budget)||0;
+
+  function changeTotal(value:string){
+    setBudget(value);
+    const nextTotal=Number(value);
+    if(!Number.isSafeInteger(nextTotal)||nextTotal<=0)return;
+    setRows(old=>old.map(row=>{
+      const pct=Number(row.percent)||0;
+      return {...row,amount:String(Math.round(nextTotal*pct/100))};
+    }));
+  }
+  function changePercent(index:number,value:string){
+    const pct=Number(value);
+    setRows(old=>old.map((row,i)=>i!==index?row:{...row,percent:value,amount:Number.isFinite(pct)&&totalAmount>0?String(Math.round(totalAmount*pct/100)):''}));
+  }
+  function addRow(){setRows(old=>[...old,{id:crypto.randomUUID(),category:'',percent:'',amount:''}]);}
+  function removeRow(index:number){setRows(old=>old.filter((_,i)=>i!==index));}
+
+  async function save(e:FormEvent){
+    e.preventDefault();
+    if(!db){ping('This app is not connected. Refresh the page or contact the administrator.');return;}
+    const firestore=db;
+    setBusy(true);
+    try{
+      const cleanName=name.trim();
+      const amount=parseNaira(budget);
+      if(cleanName.length<2||cleanName.length>100)throw userFacingError('Enter a budget name between 2 and 100 characters.');
+      if(!Number.isSafeInteger(amount)||amount<=0||amount>1_000_000_000_000)throw userFacingError('Enter a whole Naira budget between ₦1 and ₦1 trillion.');
+      const next=rows.map(row=>({id:row.id,category:row.category.trim(),percent:Number(row.percent),amount:parseNaira(row.amount)}));
+      if(next.length>100)throw userFacingError('A budget can have up to 100 allocation categories.');
+      const normalized=next.map(row=>row.category.toLocaleLowerCase());
+      if(next.some(row=>row.category.length<2||row.category.length>100))throw userFacingError('Each allocation category must be between 2 and 100 characters.');
+      if(new Set(normalized).size!==normalized.length)throw userFacingError('Each allocation category must have a unique name.');
+      if(next.some(row=>!Number.isFinite(row.percent)||row.percent<0||row.percent>100||!Number.isSafeInteger(row.amount)||row.amount<0||row.amount>1_000_000_000_000))throw userFacingError('Check the allocation percentages and Naira amounts.');
+      if(next.reduce((sum,row)=>sum+row.percent,0)>100.05||next.reduce((sum,row)=>sum+row.amount,0)>amount)throw userFacingError('Allocation percentages and amounts cannot exceed the total budget.');
+      const budgetRef=doc(firestore,'budgets',BUDGET_ID);
+      const allocationRefs=allocations.map(item=>doc(firestore,'budgetAllocations',item.id));
+      await runTransaction(firestore,async transaction=>{
+        const budgetSnapshot=await transaction.get(budgetRef);
+        const allocationSnapshots=await Promise.all(allocationRefs.map(ref=>transaction.get(ref)));
+        if(budgetExists&&!budgetSnapshot.exists())throw userFacingError('The budget was removed. Refresh the page and create it again.');
+        if(!budgetExists&&budgetSnapshot.exists())throw userFacingError('A budget was created in another session. Refresh the page to continue.');
+        const existing=new Set(allocationSnapshots.filter(item=>item.exists()).map(item=>item.id));
+        const now=serverTimestamp();
+        transaction.set(budgetRef,{name:cleanName,totalAmount:amount,year:2026,updatedAt:now,...(!budgetExists?{createdAt:now}:{})},{merge:true});
+        for(const row of next){
+          transaction.set(doc(firestore,'budgetAllocations',row.id),{budgetId:BUDGET_ID,category:row.category,percent:row.percent,amount:row.amount,updatedAt:now,...(!existing.has(row.id)?{createdAt:now}:{})},{merge:true});
+        }
+        const kept=new Set(next.map(row=>row.id));
+        if(budgetExists)for(const old of allocationRefs){if(!kept.has(old.id))transaction.delete(old);}
+      });
+      ping(budgetExists?'Budget and allocations updated.':'Budget created. You can now add allocations.');
+      onClose();
+    }catch(error:unknown){notifyError('save event budget',error,ping,'Could not save the budget. Check the values and try again.');}
+    finally{setBusy(false);}
+  }
+
+  return <div className="modal-overlay" onClick={onClose}><div className="modal" onClick={e=>e.stopPropagation()}>
+    <div className="modal-head"><div><div className="eyebrow">ADMIN CONTROLS</div><h2>{budgetExists?'Manage event budget':'Create event budget'}</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close"><X/></button></div>
+    <form onSubmit={save}><div className="modal-body">
+      <label>Budget name<input value={name} onChange={e=>setName(e.target.value)} maxLength={100} required/></label>
+      <label>Total budget (₦)<input type="number" min="1" step="1" value={budget} onChange={e=>changeTotal(e.target.value)} required/></label>
+      {budgetExists&&<>
+        <div className="panel-head"><div><h3>Category allocations</h3><p>Amounts update automatically from the percentage.</p></div><button type="button" className="btn secondary" onClick={addRow}><Plus size={15}/> Add allocation</button></div>
+        {rows.map((row,index)=><div className="form-two allocation-edit-row" key={row.id}>
+          <label>Category<input value={row.category} onChange={e=>setRows(old=>old.map((item,i)=>i===index?{...item,category:e.target.value}:item))} maxLength={100} placeholder="e.g. Sound and lighting" required/></label>
+          <label>Allocation (%)<input type="number" min="0" max="100" step="0.01" value={row.percent} onChange={e=>changePercent(index,e.target.value)} required/></label>
+          <label>Amount (₦)<input type="text" value={formatNaira(Number(row.amount)||0)} readOnly aria-label={`${row.category||'Category'} amount in Naira`}/></label>
+          <button type="button" className="icon-button danger" onClick={()=>removeRow(index)} aria-label={`Remove ${row.category||'allocation'}`}><Trash2 size={16}/></button>
+        </div>)}
+        {rows.length===0&&<div className="empty">No allocations yet. Add categories after creating the budget.</div>}
+        <div className="callout"><span>Allocated: <b>{formatNaira(allocated)}</b> ({percentage.toFixed(2)}%) · Unallocated: <b>{formatNaira(Math.max(0,totalAmount-allocated))}</b></span></div>
+      </>}
+      {!budgetExists&&<div className="callout"><span>Create the event budget first. You can add allocation categories after it is saved.</span></div>}
+    </div><div className="modal-foot"><button type="button" className="btn secondary" onClick={onClose}>Cancel</button><button disabled={busy} className="btn primary">{busy?'Saving…':budgetExists?'Save changes':'Create budget'}</button></div></form>
+  </div></div>;
 }
