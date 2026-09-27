@@ -28,7 +28,7 @@ service cloud.firestore {
         && getAfter(/databases/$(database)/documents/usernames/$(request.resource.data.username)).data.uid == uid;
       allow read: if self(uid) || admin();
       allow update: if admin() && uid != request.auth.uid
-        && resource.data.isMasterAdmin != true
+        && resource.data.get('isMasterAdmin', false) != true
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role','status','updatedAt'])
         && (request.resource.data.role in ['admin','executive','member','guest'] || request.resource.data.role == null)
         && request.resource.data.status in ['approved','rejected','suspended'];
@@ -69,7 +69,7 @@ service cloud.firestore {
         && getAfter(/databases/$(database)/documents/users/$(uid)).data.username == request.resource.data.username;
       allow read: if admin();
       allow update: if admin() && uid != request.auth.uid
-        && get(/databases/$(database)/documents/users/$(uid)).data.isMasterAdmin != true
+        && get(/databases/$(database)/documents/users/$(uid)).data.get('isMasterAdmin', false) != true
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role','status','updatedAt'])
         && (request.resource.data.role in ['admin','executive','member','guest'] || request.resource.data.role == null)
         && request.resource.data.status in ['approved','rejected','suspended'];
@@ -186,8 +186,9 @@ service cloud.firestore {
       allow read: if finance();
       allow create: if admin() && request.resource.data.name is string
         && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60
-        && request.resource.data.systemControlled != true;
-      allow update: if admin() && resource.data.systemControlled != true
+        && request.resource.data.get('systemControlled', false) is bool
+        && (request.resource.data.get('systemControlled', false) != true || (id == 'ticket-sales' && request.resource.data.name == 'Ticket Sales'));
+      allow update: if admin() && resource.data.get('systemControlled', false) != true
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','active','updatedAt'])
         && request.resource.data.name is string && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60;
       allow delete: if false;
