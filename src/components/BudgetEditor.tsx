@@ -9,7 +9,7 @@ import {notifyError,userFacingError} from '../errorHandling';
 type Row={id:string;category:string;percent:string;amount:string};
 const BUDGET_ID='event-2026';
 
-export default function BudgetEditor({allocations,total,budgetName,budgetExists,initialAdd=false,onClose,ping}:{allocations:Allocation[];total:number;budgetName:string;budgetExists:boolean;initialAdd?:boolean;onClose:()=>void;ping:(message:string)=>void}){
+export default function BudgetEditor({allocations,total,budgetName,budgetExists,initialAdd=false,actor,actorId,onClose,ping}:{allocations:Allocation[];total:number;budgetName:string;budgetExists:boolean;initialAdd?:boolean;actor:string;actorId:string;onClose:()=>void;ping:(message:string)=>void}){
   const [rows,setRows]=useState<Row[]>(()=>{
     const current=allocations.map(x=>({id:x.id,category:x.category,percent:String(Number.isFinite(x.percent)?x.percent:(total?Number((x.amount/total*100).toFixed(2)):0)),amount:String(x.amount)}));
     return initialAdd&&budgetExists?[...current,{id:crypto.randomUUID(),category:'',percent:'',amount:''}]:current;
@@ -54,7 +54,7 @@ export default function BudgetEditor({allocations,total,budgetName,budgetExists,
       if(new Set(normalized).size!==normalized.length)throw userFacingError('Each allocation category must have a unique name.');
       if(next.some(row=>!Number.isFinite(row.percent)||row.percent<0||row.percent>100||!Number.isSafeInteger(row.amount)||row.amount<0||row.amount>1_000_000_000_000))throw userFacingError('Check the allocation percentages and Naira amounts.');
       if(next.reduce((sum,row)=>sum+row.percent,0)>100.05||next.reduce((sum,row)=>sum+row.amount,0)>amount)throw userFacingError('Allocation percentages and amounts cannot exceed the total budget.');
-      const budgetRef=doc(firestore,'budgets',BUDGET_ID);
+      const budgetRef=doc(firestore,'budgets',BUDGET_ID),auditId=crypto.randomUUID();
       const allocationRefs=allocations.map(item=>doc(firestore,'budgetAllocations',item.id));
       await runTransaction(firestore,async transaction=>{
         const budgetSnapshot=await transaction.get(budgetRef);
@@ -69,6 +69,8 @@ export default function BudgetEditor({allocations,total,budgetName,budgetExists,
         }
         const kept=new Set(next.map(row=>row.id));
         if(budgetExists)for(const old of allocationRefs){if(!kept.has(old.id))transaction.delete(old);}
+        transaction.set(doc(firestore,'settings','workspace'),{auditLogId:auditId,updatedAt:now},{merge:true});
+        transaction.set(doc(firestore,'activityLogs',auditId),{actor,actorId,action:'configuration.updated',label:'configuration.updated',targetType:'settings',targetId:'workspace',createdAt:now});
       });
       ping(budgetExists?'Budget and allocations updated.':'Budget created. You can now add allocations.');
       onClose();
