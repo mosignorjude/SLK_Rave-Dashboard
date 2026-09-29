@@ -135,3 +135,12 @@
 .signup-form-wrap>.auth-form-content{flex:1;display:flex;flex-direction:column;justify-content:center}
 .signup-form-wrap>.app-footer{margin-top:auto;padding:12px 0 2px}
 @media(max-width:580px){.auth-form-side.signup-form-side{min-height:calc(100vh - 190px)}.signup-form-wrap{min-height:100%}}
+/* Accessible disclosure for the Activity Log's detailed audit payloads. */
+.audit-details{margin-top:7px;color:var(--muted);font-size:11px}.audit-details summary{width:max-content;cursor:pointer;color:var(--cyan);font-size:10px;font-weight:700;letter-spacing:.25px;outline-offset:3px}.audit-detail-list{display:grid;gap:5px;margin-top:8px;padding:10px 12px;border:1px solid var(--line);border-radius:7px;background:#0b0d13}.audit-detail-list small{display:block;color:#aeb2c1;line-height:1.5;overflow-wrap:anywhere}
+.activity-filter-toggle{display:inline-flex;align-items:center;gap:7px}.activity-filter-toggle svg{transition:transform .22s ease}.activity-filter-toggle svg.is-open{transform:rotate(180deg)}
+.activity-filter-panel{display:grid;grid-template-rows:0fr;transition:grid-template-rows .24s ease}.activity-filter-panel.is-open{grid-template-rows:1fr}.activity-filter-panel-inner{min-height:0;overflow:hidden}
+.activity-filters{display:flex;align-items:end;flex-wrap:wrap;gap:12px;padding:14px 0;border-bottom:1px solid var(--line)}.activity-filters label{display:grid;gap:5px;color:var(--muted);font-size:9px;font-weight:700;letter-spacing:.5px}.activity-filters select,.activity-filters input{min-width:150px;height:34px;padding:0 9px;border:1px solid var(--line);border-radius:6px;background:#0b0d13;color:#eef0f7;font-size:11px}.activity-filters input{min-width:145px;color-scheme:dark}.activity-filters .text-action{height:34px}
+.activity-export{display:flex;align-items:center;gap:12px}.activity-export .btn{display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
+@media(max-width:580px){.activity-export{align-items:flex-start;flex-direction:column;gap:8px}}
+@media(max-width:580px){.activity-filters{align-items:stretch;flex-direction:column}.activity-filters label,.activity-filters select,.activity-filters input{width:100%;min-width:0}.activity-filters .text-action{align-self:flex-start}}
+@media(prefers-reduced-motion:reduce){.activity-filter-panel,.activity-filter-toggle svg{transition:none}}

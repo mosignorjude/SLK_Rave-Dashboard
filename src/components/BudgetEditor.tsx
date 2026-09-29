@@ -54,6 +54,8 @@ export default function BudgetEditor({allocations,total,budgetName,budgetExists,
       if(new Set(normalized).size!==normalized.length)throw userFacingError('Each allocation category must have a unique name.');
       if(next.some(row=>!Number.isFinite(row.percent)||row.percent<0||row.percent>100||!Number.isSafeInteger(row.amount)||row.amount<0||row.amount>1_000_000_000_000))throw userFacingError('Check the allocation percentages and Naira amounts.');
       if(next.reduce((sum,row)=>sum+row.percent,0)>100.05||next.reduce((sum,row)=>sum+row.amount,0)>amount)throw userFacingError('Allocation percentages and amounts cannot exceed the total budget.');
+      const enteredReason=window.prompt('Optional reason for this budget change (up to 500 characters):'),reason=String(enteredReason||'').trim();
+      if(reason.length>500)throw userFacingError('Reason must be 500 characters or fewer.');
       const budgetRef=doc(firestore,'budgets',BUDGET_ID),auditId=crypto.randomUUID();
       const allocationRefs=allocations.map(item=>doc(firestore,'budgetAllocations',item.id));
       await runTransaction(firestore,async transaction=>{
@@ -70,7 +72,7 @@ export default function BudgetEditor({allocations,total,budgetName,budgetExists,
         const kept=new Set(next.map(row=>row.id));
         if(budgetExists)for(const old of allocationRefs){if(!kept.has(old.id))transaction.delete(old);}
         transaction.set(doc(firestore,'settings','workspace'),{auditLogId:auditId,updatedAt:now},{merge:true});
-        transaction.set(doc(firestore,'activityLogs',auditId),{actor,actorId,action:'configuration.updated',label:'configuration.updated',targetType:'settings',targetId:'workspace',createdAt:now});
+        transaction.set(doc(firestore,'activityLogs',auditId),{actor,actorId,action:'configuration.updated',label:'configuration.updated',targetType:'settings',targetId:'workspace',createdAt:now,...(reason?{reason}:{})});
       });
       ping(budgetExists?'Budget and allocations updated.':'Budget created. You can now add allocations.');
       onClose();

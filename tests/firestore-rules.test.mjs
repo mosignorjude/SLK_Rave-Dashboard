@@ -8,11 +8,14 @@ import {
   doc,
   getDoc,
   getDocs,
+  orderBy,
+  query,
   runTransaction,
   serverTimestamp,
   setDoc,
   Timestamp,
   updateDoc,
+  where,
   writeBatch,
 } from 'firebase/firestore';
 import { recordTicketSale } from '../src/ticketSales.mjs';
@@ -60,9 +63,12 @@ function validExpense(uid = 'executive') {
 }
 
 function auditEntry(uid, action, targetType, targetId) {
+  const reasonRequired = ['expense.deleted','revenue.deleted','user.approve','user.role','user.suspend','user.reactivate'].includes(action)
+    || action === 'expense.updated' || action === 'revenue.updated';
   return {
     actor: profiles[uid].fullName, actorId: uid, action, label: action,
     targetType, targetId, createdAt: serverTimestamp(),
+    ...(reasonRequired ? { reason: 'Approved test reason' } : {}),
   };
 }
 
@@ -124,7 +130,7 @@ beforeEach(async () => {
     });
     await setDoc(doc(db, 'activityLogs', 'seed-existing'), {
       actor: profiles.executive.fullName, actorId: 'executive',
-      action: 'expense.created', label: 'Recorded expense', createdAt: Timestamp.now(),
+      action: 'expense.created', label: 'Recorded expense', targetType: 'expenses', createdAt: Timestamp.now(),
     });
   });
 });
@@ -616,6 +622,99 @@ test('legacy revenue records require matching audit events for edits and deletes
   await writeAudited('admin', 'revenues', 'sample', {}, 'revenue.deleted', 'delete', 'sample');
 });
 
+test('sensitive finance edits and deletions require a bounded reason in the atomic audit event', async () => {
+  const db = client('admin');
+  async function statusChange(collectionName, id, includeReason) {
+    const batch = writeBatch(db);
+    const auditId = 'status-' + collectionName + '-' + (includeReason ? 'with' : 'without') + '-reason';
+    batch.update(doc(db, collectionName, id), {
+      status: 'Pending', updatedBy: 'admin', updatedAt: serverTimestamp(), auditLogId: auditId,
+    });
+    const event = auditEntry('admin', (collectionName === 'expenses' ? 'expense' : 'revenue') + '.updated', collectionName, id);
+    if (!includeReason) delete event.reason;
+    batch.set(doc(db, 'activityLogs', auditId), event);
+    return batch.commit();
+  }
+  await assertFails(statusChange('expenses', 'existing', false));
+  await assertSucceeds(statusChange('expenses', 'existing', true));
+  await assertFails(statusChange('revenues', 'sample', false));
+  await assertSucceeds(statusChange('revenues', 'sample', true));
+
+  async function deleteWithReason(collectionName, id, includeReason) {
+    const batch = writeBatch(db);
+    batch.delete(doc(db, collectionName, id));
+    const type = collectionName === 'expenses' ? 'expense' : 'revenue';
+    const event = auditEntry('admin', type + '.deleted', collectionName, id);
+    if (!includeReason) delete event.reason;
+    batch.set(doc(db, 'activityLogs', id), event);
+    return batch.commit();
+  }
+  await assertFails(deleteWithReason('expenses', 'existing', false));
+  await assertSucceeds(deleteWithReason('expenses', 'existing', true));
+});
+
+test('only Admins can run filtered queries against the complete audit collection', async () => {
+  const adminQuery = query(collection(client('admin'), 'activityLogs'), where('action', '==', 'expense.created'), orderBy('createdAt', 'desc'));
+  const events = await assertSucceeds(getDocs(adminQuery));
+  assert.equal(events.size, 1);
+  const combinedQuery = query(collection(client('admin'), 'activityLogs'), where('actorId', '==', 'executive'), where('targetType', '==', 'expenses'), orderBy('createdAt', 'desc'));
+  const combinedEvents = await assertSucceeds(getDocs(combinedQuery));
+  assert.equal(combinedEvents.size, 1);
+  for (const uid of ['executive','member','guest']) {
+    await assertFails(getDocs(query(collection(client(uid), 'activityLogs'), where('action', '==', 'expense.created'), orderBy('createdAt', 'desc'))));
+    await assertFails(getDocs(query(collection(client(uid), 'activityLogs'), where('actorId', '==', 'executive'), where('targetType', '==', 'expenses'), orderBy('createdAt', 'desc'))));
+  }
+  await assertFails(getDocs(query(collection(anonymous(), 'activityLogs'), where('action', '==', 'expense.created'), orderBy('createdAt', 'desc'))));
+  await assertFails(getDocs(query(collection(anonymous(), 'activityLogs'), where('actorId', '==', 'executive'), where('targetType', '==', 'expenses'), orderBy('createdAt', 'desc'))));
+});
+
+test('finance audit details use the allowlisted activity payload fields', async () => {
+  await writeAudited('admin', 'revenues', 'sample', {}, 'revenue.deleted', 'delete', 'sample', {
+    reason: 'Duplicate entry', snapshot: { title: 'Sponsor payment', category: 'Sponsorships', amount: 50000, status: 'Paid', date: '2026-09-27', method: 'Bank transfer' },
+  });
+
+  await assertFails(writeAudited('admin', 'revenues', 'sample', {}, 'revenue.deleted', 'delete', 'revenue-unsafe-snapshot', {
+    reason: 'Duplicate entry', snapshot: { title: 'Sponsor payment' }, privatePayload: 'private@example.test',
+  }));
+
+  await writeAudited('executive', 'expenses', 'existing', {
+    title: 'Updated lighting deposit', updatedBy: 'executive', updatedAt: serverTimestamp(),
+  }, 'expense.updated', 'update', 'expense-safe-changes', {
+    changes: { title: { before: { present: true, value: 'Stage lighting deposit' }, after: { present: true, value: 'Updated lighting deposit' } } },
+  });
+
+  await assertFails(writeAudited('executive', 'revenues', 'sample', {
+    title: 'Updated sponsor payment', updatedBy: 'executive', updatedAt: serverTimestamp(),
+  }, 'revenue.updated', 'update', 'revenue-unsafe-changes', {
+    changes: { title: { before: { present: true, value: 'Sponsor payment' }, after: { present: true, value: 'Updated sponsor payment' } } }, privatePayload: 'private@example.test',
+  }));
+});
+
+test('role grants and access changes reject missing or whitespace-only reasons', async () => {
+  const db = client('admin');
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'users', 'member'), { role: 'executive', auditLogId: 'role-no-reason', updatedAt: serverTimestamp() });
+  batch.update(doc(db, 'usersPublic', 'member'), { role: 'executive', auditLogId: 'role-no-reason', updatedAt: serverTimestamp() });
+  const missing = auditEntry('admin', 'user.role', 'users', 'member');
+  delete missing.reason;
+  batch.set(doc(db, 'activityLogs', 'role-no-reason'), missing);
+  await assertFails(batch.commit());
+
+  const whitespace = writeBatch(db);
+  whitespace.update(doc(db, 'users', 'member'), { role: 'executive', auditLogId: 'role-whitespace-reason', updatedAt: serverTimestamp() });
+  whitespace.update(doc(db, 'usersPublic', 'member'), { role: 'executive', auditLogId: 'role-whitespace-reason', updatedAt: serverTimestamp() });
+  whitespace.set(doc(db, 'activityLogs', 'role-whitespace-reason'), {
+    ...auditEntry('admin', 'user.role', 'users', 'member'), reason: '   ',
+  });
+  await assertFails(whitespace.commit());
+
+  const valid = writeBatch(db);
+  valid.update(doc(db, 'users', 'member'), { role: 'executive', auditLogId: 'role-with-reason', updatedAt: serverTimestamp() });
+  valid.update(doc(db, 'usersPublic', 'member'), { role: 'executive', auditLogId: 'role-with-reason', updatedAt: serverTimestamp() });
+  valid.set(doc(db, 'activityLogs', 'role-with-reason'), auditEntry('admin', 'user.role', 'users', 'member'));
+  await assertSucceeds(valid.commit());
+});
+
 test('members cannot edit expenses', async () => {
   await assertFails(updateDoc(doc(client('member'), 'expenses', 'existing'), {
     title: 'Changed by member', updatedBy: 'member', updatedAt: serverTimestamp(),
@@ -824,7 +923,7 @@ test('expense update and delete audit events must match the same atomic operatio
   adminDeleteBatch.delete(doc(adminDb, 'expenses', 'existing'));
   adminDeleteBatch.set(doc(adminDb, 'activityLogs', 'existing'), {
     actor: profiles.admin.fullName, actorId: 'admin', action: 'expense.deleted',
-    label: 'expense.deleted', targetType: 'expenses', targetId: 'existing', createdAt: serverTimestamp(),
+    label: 'expense.deleted', targetType: 'expenses', targetId: 'existing', createdAt: serverTimestamp(), reason: 'Duplicate entry',
   });
   await assertSucceeds(adminDeleteBatch.commit());
 });
@@ -841,7 +940,7 @@ test('user role audit events require matching profile changes in the same batch'
   batch.update(doc(db, 'usersPublic', 'executive'), { role: 'member', auditLogId: 'user-role', updatedAt: serverTimestamp() });
   batch.set(doc(db, 'activityLogs', 'user-role'), {
     actor: profiles.admin.fullName, actorId: 'admin', action: 'user.role',
-    label: 'user.role', targetType: 'users', targetId: 'executive', createdAt: serverTimestamp(),
+    label: 'user.role', targetType: 'users', targetId: 'executive', createdAt: serverTimestamp(), reason: 'Approved test reason',
   });
   await assertSucceeds(batch.commit());
 });

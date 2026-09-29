@@ -16,9 +16,15 @@ service cloud.firestore {
       let before = get(/databases/$(database)/documents/expenses/$(id));
       let after = getAfter(/databases/$(database)/documents/expenses/$(id));
       let amountChanged = before.data.amount != after.data.amount;
+      let statusChanged = before.data.status != after.data.status;
+      let changes = request.resource.data.get('changes',{});
       return exists(/databases/$(database)/documents/expenses/$(id)) && existsAfter(/databases/$(database)/documents/expenses/$(id))
         && after.data.updatedBy == request.auth.uid
         && after.data.updatedAt == request.time
+        && (!request.resource.data.keys().hasAny(['changes']) || (validAuditChanges(changes)
+          && auditChangeMatches(changes,'amount',before.data,after.data)
+          && auditChangeMatches(changes,'status',before.data,after.data)))
+        && (!(amountChanged || statusChanged) || validReason(request.resource.data.get('reason', null)))
         && ((!amountChanged && !request.resource.data.keys().hasAny(['previousAmount','newAmount']))
           || (amountChanged
             && request.resource.data.previousAmount == before.data.amount
@@ -26,11 +32,22 @@ service cloud.firestore {
             && after.data.previousAmount == before.data.amount));
     }
     function activityRevenueUpdateMatches(id) {
+      let before = get(/databases/$(database)/documents/revenues/$(id));
       let after = getAfter(/databases/$(database)/documents/revenues/$(id));
+      let changes = request.resource.data.get('changes',{});
       return exists(/databases/$(database)/documents/revenues/$(id))
         && existsAfter(/databases/$(database)/documents/revenues/$(id))
         && after.data.updatedBy == request.auth.uid
-        && after.data.updatedAt == request.time;
+        && after.data.updatedAt == request.time
+        && (!request.resource.data.keys().hasAny(['changes']) || (validAuditChanges(changes)
+          && auditChangeMatches(changes,'amount',before.data,after.data)
+          && auditChangeMatches(changes,'status',before.data,after.data)))
+        && ((before.data.amount == after.data.amount && before.data.status == after.data.status)
+          || validReason(request.resource.data.get('reason', null)));
+    }
+    function validReason(reason) {
+      return reason is string && reason.size() >= 1 && reason.size() <= 500
+        && reason.matches('.*\\S.*');
     }
     function activityUserChangeMatches(action, id) {
       let before = get(/databases/$(database)/documents/users/$(id));
@@ -54,39 +71,69 @@ service cloud.firestore {
       let action = request.resource.data.action;
       let id = request.resource.data.targetId;
       let target = request.resource.data.targetType;
-      return (action == 'ticket.sale' && target == 'ticketSales'
+      return action == 'ticket.sale' ? (target == 'ticketSales'
           && !exists(/databases/$(database)/documents/ticketSales/$(id))
           && existsAfter(/databases/$(database)/documents/ticketSales/$(id))
           && getAfter(/databases/$(database)/documents/ticketSales/$(id)).data.agentId == request.auth.uid)
-        || (action == 'expense.created' && target == 'expenses'
+        : action == 'expense.created' ? (target == 'expenses'
           && !exists(/databases/$(database)/documents/expenses/$(id))
           && existsAfter(/databases/$(database)/documents/expenses/$(id))
           && getAfter(/databases/$(database)/documents/expenses/$(id)).data.createdBy == request.auth.uid)
-        || (action == 'revenue.created' && target == 'revenues'
+        : action == 'revenue.created' ? (target == 'revenues'
           && !exists(/databases/$(database)/documents/revenues/$(id))
           && existsAfter(/databases/$(database)/documents/revenues/$(id))
           && getAfter(/databases/$(database)/documents/revenues/$(id)).data.createdBy == request.auth.uid)
-        || (action == 'expense.updated' && target == 'expenses'
+        : action == 'expense.updated' ? (target == 'expenses'
           && activityExpenseUpdateMatches(id))
-        || (action == 'revenue.updated' && target == 'revenues'
+        : action == 'revenue.updated' ? (target == 'revenues'
           && activityRevenueUpdateMatches(id))
-        || (action == 'expense.deleted' && target == 'expenses'
+        : action == 'expense.deleted' ? (target == 'expenses'
           && exists(/databases/$(database)/documents/expenses/$(id))
           && !existsAfter(/databases/$(database)/documents/expenses/$(id))
+          && (!request.resource.data.keys().hasAny(['snapshot']) || auditSnapshotMatches(request.resource.data.snapshot,get(/databases/$(database)/documents/expenses/$(id)).data))
           && (get(/databases/$(database)/documents/expenses/$(id)).data.createdBy == request.auth.uid || profile().role == 'admin'))
-        || (action == 'revenue.deleted' && target == 'revenues'
+        : action == 'revenue.deleted' ? (target == 'revenues'
           && exists(/databases/$(database)/documents/revenues/$(id))
           && !existsAfter(/databases/$(database)/documents/revenues/$(id))
+          && (!request.resource.data.keys().hasAny(['snapshot']) || auditSnapshotMatches(request.resource.data.snapshot,get(/databases/$(database)/documents/revenues/$(id)).data))
           && (get(/databases/$(database)/documents/revenues/$(id)).data.createdBy == request.auth.uid || profile().role == 'admin'))
-        || (action in ['user.approve','user.reject','user.role','user.suspend','user.reactivate'] && target == 'users'
+        : action in ['user.approve','user.reject','user.role','user.suspend','user.reactivate'] ? (target == 'users'
           && activityUserChangeMatches(action,id))
-        || (action == 'configuration.updated' && target == 'settings' && id == 'workspace'
+        : action == 'configuration.updated' ? (target == 'settings' && id == 'workspace'
           && existsAfter(/databases/$(database)/documents/settings/workspace)
           && getAfter(/databases/$(database)/documents/settings/workspace).data.auditLogId == logId
-          && getAfter(/databases/$(database)/documents/settings/workspace).data.updatedAt == request.time);
+          && getAfter(/databases/$(database)/documents/settings/workspace).data.updatedAt == request.time)
+        : false;
     }
     function validMoney(v) { return v is int && v >= 0 && v <= 1000000000000; }
     function validDate(v) { return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
+    function validAuditSnapshot(snapshot) {
+      return snapshot is map && snapshot.keys().hasOnly(['title','category','budgetAllocationId','amount','status','date','method','agent','createdBy']);
+    }
+    function validAuditChanges(changes) {
+      return changes is map && changes.keys().hasOnly(['title','category','budgetAllocationId','amount','status','date','method','agent','createdBy']);
+    }
+    function auditSideMatches(side, record, field) {
+      return side is map && side.keys().hasOnly(['present','value']) && side.keys().hasAll(['present'])
+        && side.present is bool && side.present == record.keys().hasAny([field])
+        && (side.present ? side.keys().hasAll(['value']) && side.value == record.get(field,null) : !side.keys().hasAny(['value']));
+    }
+    function auditChangeMatches(changes, field, before, after) {
+      return !changes.keys().hasAny([field]) || (changes.get(field,null) is map
+        && changes.get(field,null).keys().hasOnly(['before','after'])
+        && changes.get(field,null).keys().hasAll(['before','after'])
+        && auditSideMatches(changes.get(field,null).before,before,field)
+        && auditSideMatches(changes.get(field,null).after,after,field));
+    }
+    function auditSnapshotMatches(snapshot, record) {
+      return validAuditSnapshot(snapshot)
+        && snapshot.keys().hasAny(['title']) == record.keys().hasAny(['title'])
+        && (!snapshot.keys().hasAny(['title']) || snapshot.title == record.get('title',null))
+        && snapshot.keys().hasAny(['amount']) == record.keys().hasAny(['amount'])
+        && (!snapshot.keys().hasAny(['amount']) || snapshot.amount == record.get('amount',null))
+        && snapshot.keys().hasAny(['status']) == record.keys().hasAny(['status'])
+        && (!snapshot.keys().hasAny(['status']) || snapshot.status == record.get('status',null));
+    }
     function linkedAudit(logId, action, target, targetId) {
       let audit = getAfter(/databases/$(database)/documents/activityLogs/$(logId));
       return logId is string && existsAfter(/databases/$(database)/documents/activityLogs/$(logId))
@@ -382,7 +429,12 @@ service cloud.firestore {
     match /activityLogs/{id} {
       allow read: if admin();
       allow create: if signedIn() && request.resource.data.actorId == request.auth.uid
-        && request.resource.data.keys().hasOnly(['actor','actorId','action','label','targetType','targetId','createdAt','previousAmount','newAmount'])
+        && request.resource.data.keys().hasOnly(['actor','actorId','action','label','targetType','targetId','createdAt','previousAmount','newAmount','reason','changes','snapshot'])
+        && (!request.resource.data.keys().hasAny(['changes']) || (request.resource.data.action in ['expense.updated','revenue.updated'] && validAuditChanges(request.resource.data.changes)))
+        && (!request.resource.data.keys().hasAny(['snapshot']) || (request.resource.data.action in ['expense.deleted','revenue.deleted'] && validAuditSnapshot(request.resource.data.snapshot)))
+        && (request.resource.data.get('action','') in ['expense.deleted','revenue.deleted','user.approve','user.role','user.suspend','user.reactivate']
+          ? validReason(request.resource.data.get('reason', null))
+          : (!request.resource.data.keys().hasAny(['reason']) || validReason(request.resource.data.reason)))
         && (!request.resource.data.keys().hasAny(['previousAmount','newAmount'])
           || (request.resource.data.action == 'expense.updated'
             && request.resource.data.keys().hasAll(['previousAmount','newAmount'])
@@ -400,8 +452,8 @@ service cloud.firestore {
             && request.resource.data.actor == profile().fullName
             && activityTargetMatches(id)
             && ((request.resource.data.action == 'ticket.sale' && profile().role in ['admin','executive','member'])
-              || (request.resource.data.action.matches('^(expense|revenue)\\.(created|updated|deleted)$') && profile().role in ['admin','executive'])
-              || (request.resource.data.action.matches('^user\\.(approve|reject|role|suspend|reactivate)$') && profile().role == 'admin')
+              || (request.resource.data.action in ['expense.created','expense.updated','expense.deleted','revenue.created','revenue.updated','revenue.deleted'] && profile().role in ['admin','executive'])
+              || (request.resource.data.action in ['user.approve','user.reject','user.role','user.suspend','user.reactivate'] && profile().role == 'admin')
               || (request.resource.data.action == 'configuration.updated' && profile().role == 'admin')))
           || (request.resource.data.action == 'user.signup'
           && request.resource.data.targetType == 'users'
