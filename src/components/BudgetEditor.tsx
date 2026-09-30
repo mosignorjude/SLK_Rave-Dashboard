@@ -1,10 +1,13 @@
 import {useMemo,useState,type FormEvent} from 'react';
-import {doc,runTransaction,serverTimestamp} from 'firebase/firestore';
+import {collection,doc,getDocsFromServer,limit,query,runTransaction,serverTimestamp,where} from 'firebase/firestore';
 import {Plus,Trash2,X} from 'lucide-react';
 import type {Allocation} from '../types';
 import {db} from '../firebase';
 import {formatNaira,parseNaira} from '../money';
 import {notifyError,userFacingError} from '../errorHandling';
+import {configurationAuditChanges} from '../configurationChanges.mjs';
+import {getReferencedAllocationIds,type BudgetExpense} from '../budget';
+import ModalDialog from './ModalDialog';
 
 type Row={id:string;category:string;percent:string;amount:string};
 const BUDGET_ID='event-2026';
@@ -54,25 +57,51 @@ export default function BudgetEditor({allocations,total,budgetName,budgetExists,
       if(new Set(normalized).size!==normalized.length)throw userFacingError('Each allocation category must have a unique name.');
       if(next.some(row=>!Number.isFinite(row.percent)||row.percent<0||row.percent>100||!Number.isSafeInteger(row.amount)||row.amount<0||row.amount>1_000_000_000_000))throw userFacingError('Check the allocation percentages and Naira amounts.');
       if(next.reduce((sum,row)=>sum+row.percent,0)>100.05||next.reduce((sum,row)=>sum+row.amount,0)>amount)throw userFacingError('Allocation percentages and amounts cannot exceed the total budget.');
+      const keptAllocationIds=new Set(next.map(row=>row.id));
+      const removedAllocationIds=budgetExists?allocations.filter(item=>!keptAllocationIds.has(item.id)).map(item=>item.id):[];
+      for(let offset=0;offset<removedAllocationIds.length;offset+=30){
+        const allocationIds=removedAllocationIds.slice(offset,offset+30);
+        const linkedExpenses=await getDocsFromServer(query(collection(firestore,'expenses'),where('budgetAllocationId','in',allocationIds),limit(1)));
+        const referencedIds=getReferencedAllocationIds(linkedExpenses.docs.map(snapshot=>snapshot.data() as BudgetExpense),allocationIds);
+        if(referencedIds.length)throw userFacingError('An allocation cannot be removed while expenses are assigned to it. Reassign those expenses first, then try again.');
+      }
       const enteredReason=window.prompt('Optional reason for this budget change (up to 500 characters):'),reason=String(enteredReason||'').trim();
       if(reason.length>500)throw userFacingError('Reason must be 500 characters or fewer.');
       const budgetRef=doc(firestore,'budgets',BUDGET_ID),auditId=crypto.randomUUID();
       const allocationRefs=allocations.map(item=>doc(firestore,'budgetAllocations',item.id));
+      const nextAllocationRefs=next.map(item=>doc(firestore,'budgetAllocations',item.id));
+      const allAllocationRefs=[...new Map([...allocationRefs,...nextAllocationRefs].map(ref=>[ref.id,ref])).values()];
       await runTransaction(firestore,async transaction=>{
         const budgetSnapshot=await transaction.get(budgetRef);
-        const allocationSnapshots=await Promise.all(allocationRefs.map(ref=>transaction.get(ref)));
+        const allocationSnapshots=await Promise.all(allAllocationRefs.map(ref=>transaction.get(ref)));
         if(budgetExists&&!budgetSnapshot.exists())throw userFacingError('The budget was removed. Refresh the page and create it again.');
         if(!budgetExists&&budgetSnapshot.exists())throw userFacingError('A budget was created in another session. Refresh the page to continue.');
+        const snapshotsById=new Map(allocationSnapshots.map(snapshot=>[snapshot.id,snapshot]));
         const existing=new Set(allocationSnapshots.filter(item=>item.exists()).map(item=>item.id));
         const now=serverTimestamp();
+        const kept=new Set(next.map(row=>row.id));
+        const pick=(data:any,fields:string[])=>data?Object.fromEntries(fields.filter(field=>Object.hasOwn(data,field)).map(field=>[field,data[field]])):null;
+        const budgetBefore=budgetSnapshot.exists()?budgetSnapshot.data():null;
+        const changes=configurationAuditChanges([
+          {path:`budgets/${BUDGET_ID}`,before:pick(budgetBefore,['name','totalAmount','year']),after:{name:cleanName,totalAmount:amount,year:2026}},
+          ...next.map(row=>{
+            const snapshot=snapshotsById.get(row.id),before=snapshot?.exists()?snapshot.data():null;
+            const nextData={...(before||{}),budgetId:BUDGET_ID,category:row.category,percent:row.percent,amount:row.amount};
+            return {path:`budgetAllocations/${row.id}`,before:pick(before,['budgetId','categoryId','category','percent','amount']),after:pick(nextData,['budgetId','categoryId','category','percent','amount'])};
+          }),
+          ...(budgetExists?allocationRefs.filter(ref=>!kept.has(ref.id)).map(ref=>{
+            const snapshot=snapshotsById.get(ref.id);
+            return {path:`budgetAllocations/${ref.id}`,before:pick(snapshot?.exists()?snapshot.data():null,['budgetId','categoryId','category','percent','amount']),after:null};
+          }):[]),
+        ]);
+        if(!Object.keys(changes).length)return;
         transaction.set(budgetRef,{name:cleanName,totalAmount:amount,year:2026,updatedAt:now,...(!budgetExists?{createdAt:now}:{})},{merge:true});
         for(const row of next){
           transaction.set(doc(firestore,'budgetAllocations',row.id),{budgetId:BUDGET_ID,category:row.category,percent:row.percent,amount:row.amount,updatedAt:now,...(!existing.has(row.id)?{createdAt:now}:{})},{merge:true});
         }
-        const kept=new Set(next.map(row=>row.id));
         if(budgetExists)for(const old of allocationRefs){if(!kept.has(old.id))transaction.delete(old);}
         transaction.set(doc(firestore,'settings','workspace'),{auditLogId:auditId,updatedAt:now},{merge:true});
-        transaction.set(doc(firestore,'activityLogs',auditId),{actor,actorId,action:'configuration.updated',label:'configuration.updated',targetType:'settings',targetId:'workspace',createdAt:now,...(reason?{reason}:{})});
+        transaction.set(doc(firestore,'activityLogs',auditId),{actor,actorId,action:'configuration.updated',label:'configuration.updated',targetType:'settings',targetId:'workspace',createdAt:now,changes,...(reason?{reason}:{})});
       });
       ping(budgetExists?'Budget and allocations updated.':'Budget created. You can now add allocations.');
       onClose();
@@ -80,9 +109,9 @@ export default function BudgetEditor({allocations,total,budgetName,budgetExists,
     finally{setBusy(false);}
   }
 
-  return <div className="modal-overlay" onClick={onClose}><div className="modal" onClick={e=>e.stopPropagation()}>
-    <div className="modal-head"><div><div className="eyebrow">ADMIN CONTROLS</div><h2>{budgetExists?'Manage event budget':'Create event budget'}</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close"><X/></button></div>
-    <form onSubmit={save}><div className="modal-body">
+  return <ModalDialog onClose={onClose} labelledBy="event-budget-dialog-title" className="budget-editor-modal">
+    <div className="modal-head"><div><div className="eyebrow">ADMIN CONTROLS</div><h2 id="event-budget-dialog-title">{budgetExists?'Manage event budget':'Create event budget'}</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close"><X/></button></div>
+    <form className="budget-editor-form" onSubmit={save}><div className="modal-body">
       <label>Budget name<input value={name} onChange={e=>setName(e.target.value)} maxLength={100} required/></label>
       <label>Total budget (₦)<input type="number" min="1" step="1" value={budget} onChange={e=>changeTotal(e.target.value)} required/></label>
       {budgetExists&&<>
@@ -98,5 +127,5 @@ export default function BudgetEditor({allocations,total,budgetName,budgetExists,
       </>}
       {!budgetExists&&<div className="callout"><span>Create the event budget first. You can add allocation categories after it is saved.</span></div>}
     </div><div className="modal-foot"><button type="button" className="btn secondary" onClick={onClose}>Cancel</button><button disabled={busy} className="btn primary">{busy?'Saving…':budgetExists?'Save changes':'Create budget'}</button></div></form>
-  </div></div>;
+  </ModalDialog>;
 }

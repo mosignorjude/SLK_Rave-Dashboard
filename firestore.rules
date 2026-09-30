@@ -9,21 +9,28 @@ service cloud.firestore {
     function financeReader() { return approved() && profile().role in ['admin', 'executive', 'member', 'guest']; }
     function financeWriter() { return approved() && profile().role in ['admin', 'executive']; }
     function ticketAgent() { return approved() && profile().role in ['admin', 'executive', 'member']; }
+    function createdAtServerTimeIfPresent() {
+      return !request.resource.data.keys().hasAny(['createdAt']) || request.resource.data.createdAt == request.time;
+    }
+    function updatedAtServerTimeIfChanged() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(['updatedAt'])
+        || request.resource.data.updatedAt == request.time;
+    }
+    function createdAtServerTimeIfChanged() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(['createdAt'])
+        || request.resource.data.createdAt == request.time;
+    }
     function allowedActivityAction(action) {
-      return action in ['ticket.sale','expense.created','expense.updated','expense.deleted','revenue.created','revenue.updated','revenue.deleted','user.signup','user.master_admin_claimed','user.approve','user.reject','user.role','user.suspend','user.reactivate','configuration.updated'];
+      return action in ['ticket.sale','ticket.sale.deleted','expense.created','expense.updated','expense.deleted','revenue.created','revenue.updated','revenue.deleted','user.signup','user.master_admin_claimed','user.approve','user.reject','user.role','user.suspend','user.reactivate','configuration.updated'];
     }
     function activityExpenseUpdateMatches(id) {
       let before = get(/databases/$(database)/documents/expenses/$(id));
       let after = getAfter(/databases/$(database)/documents/expenses/$(id));
       let amountChanged = before.data.amount != after.data.amount;
       let statusChanged = before.data.status != after.data.status;
-      let changes = request.resource.data.get('changes',{});
       return exists(/databases/$(database)/documents/expenses/$(id)) && existsAfter(/databases/$(database)/documents/expenses/$(id))
         && after.data.updatedBy == request.auth.uid
         && after.data.updatedAt == request.time
-        && (!request.resource.data.keys().hasAny(['changes']) || (validAuditChanges(changes)
-          && auditChangeMatches(changes,'amount',before.data,after.data)
-          && auditChangeMatches(changes,'status',before.data,after.data)))
         && (!(amountChanged || statusChanged) || validReason(request.resource.data.get('reason', null)))
         && ((!amountChanged && !request.resource.data.keys().hasAny(['previousAmount','newAmount']))
           || (amountChanged
@@ -34,14 +41,10 @@ service cloud.firestore {
     function activityRevenueUpdateMatches(id) {
       let before = get(/databases/$(database)/documents/revenues/$(id));
       let after = getAfter(/databases/$(database)/documents/revenues/$(id));
-      let changes = request.resource.data.get('changes',{});
       return exists(/databases/$(database)/documents/revenues/$(id))
         && existsAfter(/databases/$(database)/documents/revenues/$(id))
         && after.data.updatedBy == request.auth.uid
         && after.data.updatedAt == request.time
-        && (!request.resource.data.keys().hasAny(['changes']) || (validAuditChanges(changes)
-          && auditChangeMatches(changes,'amount',before.data,after.data)
-          && auditChangeMatches(changes,'status',before.data,after.data)))
         && ((before.data.amount == after.data.amount && before.data.status == after.data.status)
           || validReason(request.resource.data.get('reason', null)));
     }
@@ -75,6 +78,20 @@ service cloud.firestore {
           && !exists(/databases/$(database)/documents/ticketSales/$(id))
           && existsAfter(/databases/$(database)/documents/ticketSales/$(id))
           && getAfter(/databases/$(database)/documents/ticketSales/$(id)).data.agentId == request.auth.uid)
+        : action == 'ticket.sale.deleted' ? (target == 'ticketSales'
+          && exists(/databases/$(database)/documents/ticketSales/$(id))
+          && !existsAfter(/databases/$(database)/documents/ticketSales/$(id))
+          && request.resource.data.keys().hasAny(['snapshot'])
+          && auditSnapshotMatches(request.resource.data.snapshot,get(/databases/$(database)/documents/ticketSales/$(id)).data)
+          && validReason(request.resource.data.get('reason',null))
+          && profile().role == 'admin'
+          && (!exists(/databases/$(database)/documents/ticketTiers/$(get(/databases/$(database)/documents/ticketSales/$(id)).data.tierId))
+            || (existsAfter(/databases/$(database)/documents/ticketTiers/$(get(/databases/$(database)/documents/ticketSales/$(id)).data.tierId))
+              && getAfter(/databases/$(database)/documents/ticketTiers/$(get(/databases/$(database)/documents/ticketSales/$(id)).data.tierId)).data.lastDeletedSaleId == id
+              && getAfter(/databases/$(database)/documents/ticketTiers/$(get(/databases/$(database)/documents/ticketSales/$(id)).data.tierId)).data.auditLogId == logId
+              && getAfter(/databases/$(database)/documents/ticketTiers/$(get(/databases/$(database)/documents/ticketSales/$(id)).data.tierId)).data.sold
+                == get(/databases/$(database)/documents/ticketTiers/$(get(/databases/$(database)/documents/ticketSales/$(id)).data.tierId)).data.sold - get(/databases/$(database)/documents/ticketSales/$(id)).data.quantity
+              && getAfter(/databases/$(database)/documents/ticketTiers/$(get(/databases/$(database)/documents/ticketSales/$(id)).data.tierId)).data.updatedAt == request.time)))
         : action == 'expense.created' ? (target == 'expenses'
           && !exists(/databases/$(database)/documents/expenses/$(id))
           && existsAfter(/databases/$(database)/documents/expenses/$(id))
@@ -90,12 +107,12 @@ service cloud.firestore {
         : action == 'expense.deleted' ? (target == 'expenses'
           && exists(/databases/$(database)/documents/expenses/$(id))
           && !existsAfter(/databases/$(database)/documents/expenses/$(id))
-          && (!request.resource.data.keys().hasAny(['snapshot']) || auditSnapshotMatches(request.resource.data.snapshot,get(/databases/$(database)/documents/expenses/$(id)).data))
+          && request.resource.data.keys().hasAny(['snapshot']) && auditSnapshotMatches(request.resource.data.snapshot,get(/databases/$(database)/documents/expenses/$(id)).data)
           && (get(/databases/$(database)/documents/expenses/$(id)).data.createdBy == request.auth.uid || profile().role == 'admin'))
         : action == 'revenue.deleted' ? (target == 'revenues'
           && exists(/databases/$(database)/documents/revenues/$(id))
           && !existsAfter(/databases/$(database)/documents/revenues/$(id))
-          && (!request.resource.data.keys().hasAny(['snapshot']) || auditSnapshotMatches(request.resource.data.snapshot,get(/databases/$(database)/documents/revenues/$(id)).data))
+          && request.resource.data.keys().hasAny(['snapshot']) && auditSnapshotMatches(request.resource.data.snapshot,get(/databases/$(database)/documents/revenues/$(id)).data)
           && (get(/databases/$(database)/documents/revenues/$(id)).data.createdBy == request.auth.uid || profile().role == 'admin'))
         : action in ['user.approve','user.reject','user.role','user.suspend','user.reactivate'] ? (target == 'users'
           && activityUserChangeMatches(action,id))
@@ -108,37 +125,30 @@ service cloud.firestore {
     function validMoney(v) { return v is int && v >= 0 && v <= 1000000000000; }
     function validDate(v) { return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
     function validAuditSnapshot(snapshot) {
-      return snapshot is map && snapshot.keys().hasOnly(['title','category','budgetAllocationId','amount','status','date','method','agent','createdBy']);
+      return snapshot is map;
     }
     function validAuditChanges(changes) {
-      return changes is map && changes.keys().hasOnly(['title','category','budgetAllocationId','amount','status','date','method','agent','createdBy']);
+      return changes is map && changes.keys().hasOnly(['before','after']) && changes.keys().hasAll(['before','after']);
     }
-    function auditSideMatches(side, record, field) {
-      return side is map && side.keys().hasOnly(['present','value']) && side.keys().hasAll(['present'])
-        && side.present is bool && side.present == record.keys().hasAny([field])
-        && (side.present ? side.keys().hasAll(['value']) && side.value == record.get(field,null) : !side.keys().hasAny(['value']));
-    }
-    function auditChangeMatches(changes, field, before, after) {
-      return !changes.keys().hasAny([field]) || (changes.get(field,null) is map
-        && changes.get(field,null).keys().hasOnly(['before','after'])
-        && changes.get(field,null).keys().hasAll(['before','after'])
-        && auditSideMatches(changes.get(field,null).before,before,field)
-        && auditSideMatches(changes.get(field,null).after,after,field));
+    function validConfigurationChanges(changes) {
+      return changes is map && changes.size() <= 120;
     }
     function auditSnapshotMatches(snapshot, record) {
-      return validAuditSnapshot(snapshot)
-        && snapshot.keys().hasAny(['title']) == record.keys().hasAny(['title'])
-        && (!snapshot.keys().hasAny(['title']) || snapshot.title == record.get('title',null))
-        && snapshot.keys().hasAny(['amount']) == record.keys().hasAny(['amount'])
-        && (!snapshot.keys().hasAny(['amount']) || snapshot.amount == record.get('amount',null))
-        && snapshot.keys().hasAny(['status']) == record.keys().hasAny(['status'])
-        && (!snapshot.keys().hasAny(['status']) || snapshot.status == record.get('status',null));
+      return validAuditSnapshot(snapshot) && snapshot == record;
+    }
+    function financeAuditChangesMatch(changes, before, after) {
+      return validAuditChanges(changes) && changes.before == before && changes.after == after;
     }
     function linkedAudit(logId, action, target, targetId) {
       let audit = getAfter(/databases/$(database)/documents/activityLogs/$(logId));
       return logId is string && existsAfter(/databases/$(database)/documents/activityLogs/$(logId))
         && audit.data.actorId == request.auth.uid && audit.data.action == action
-        && audit.data.label == action && audit.data.targetType == target && audit.data.targetId == targetId;
+        && audit.data.label == action && audit.data.targetType == target && audit.data.targetId == targetId
+        && (action == 'expense.updated' ? (audit.data.keys().hasAny(['changes'])
+          && financeAuditChangesMatch(audit.data.changes,get(/databases/$(database)/documents/expenses/$(targetId)).data,getAfter(/databases/$(database)/documents/expenses/$(targetId)).data))
+          : action == 'revenue.updated' ? (audit.data.keys().hasAny(['changes'])
+            && financeAuditChangesMatch(audit.data.changes,get(/databases/$(database)/documents/revenues/$(targetId)).data,getAfter(/databases/$(database)/documents/revenues/$(targetId)).data))
+          : true);
     }
     function linkedUserAudit(logId, targetId) {
       let audit = getAfter(/databases/$(database)/documents/activityLogs/$(logId));
@@ -153,6 +163,12 @@ service cloud.firestore {
         && marker.data.updatedAt == request.time
         && linkedAudit(marker.data.auditLogId,'configuration.updated','settings','workspace');
     }
+    function configurationPathAudited(collectionName, id) {
+      let marker = getAfter(/databases/$(database)/documents/settings/workspace);
+      let audit = getAfter(/databases/$(database)/documents/activityLogs/$(marker.data.auditLogId));
+      let path = collectionName + '/' + id;
+      return audit.data.changes is map && audit.data.changes.keys().hasAny([path]);
+    }
 
     match /users/{uid} {
       allow create: if self(uid)
@@ -166,7 +182,7 @@ service cloud.firestore {
         && request.resource.data.username.matches('^[a-z0-9_-]{3,24}$')
         && request.resource.data.usernameKey == request.resource.data.username
         && request.resource.data.email == request.auth.token.email
-        && request.resource.data.createdAt is timestamp
+        && request.resource.data.createdAt == request.time
         && request.resource.data.role == 'guest'
         && request.resource.data.status == 'approved'
         && getAfter(/databases/$(database)/documents/usernames/$(request.resource.data.username)).data.uid == uid;
@@ -174,6 +190,7 @@ service cloud.firestore {
       allow update: if admin() && uid != request.auth.uid
         && resource.data.get('isMasterAdmin', false) != true
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role','status','updatedAt','auditLogId'])
+        && updatedAtServerTimeIfChanged()
         && linkedUserAudit(request.resource.data.auditLogId,uid)
         && request.resource.data.auditLogId == getAfter(/databases/$(database)/documents/usersPublic/$(uid)).data.auditLogId
         && (request.resource.data.role in ['admin','executive','member','guest'] || request.resource.data.role == null)
@@ -186,6 +203,7 @@ service cloud.firestore {
         && request.auth.token.email_verified == true
         && !exists(/databases/$(database)/documents/settings/masterAdmin)
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role','status','isMasterAdmin','updatedAt','auditLogId'])
+        && updatedAtServerTimeIfChanged()
         && linkedAudit(request.resource.data.auditLogId,'user.master_admin_claimed','users',uid)
         && request.resource.data.role == 'admin'
         && request.resource.data.status == 'approved'
@@ -198,7 +216,7 @@ service cloud.firestore {
         && request.resource.data.keys().hasOnly(['uid','username','createdAt'])
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.username == username && username.matches('^[a-z0-9_-]{3,24}$')
-        && request.resource.data.createdAt is timestamp
+        && request.resource.data.createdAt == request.time
         && linkedAudit(getAfter(/databases/$(database)/documents/users/$(request.resource.data.uid)).data.auditLogId,'user.signup','users',request.resource.data.uid)
         && !exists(/databases/$(database)/documents/usernames/$(username));
       allow read, update, delete: if false;
@@ -210,17 +228,18 @@ service cloud.firestore {
         && request.resource.data.email == request.auth.token.email
         && request.resource.data.role == 'guest'
         && request.resource.data.status == 'approved'
-        && request.resource.data.createdAt is timestamp
+        && request.resource.data.createdAt == request.time
         && request.resource.data.keys().hasOnly(['uid','fullName','username','email','role','status','createdAt','auditLogId'])
         && linkedAudit(request.resource.data.auditLogId,'user.signup','users',uid)
         && request.resource.data.fullName is string && request.resource.data.fullName.size() >= 2 && request.resource.data.fullName.size() <= 100
         && request.resource.data.username is string && request.resource.data.username.matches('^[a-z0-9_-]{3,24}$')
-        && request.resource.data.createdAt is timestamp
+        && request.resource.data.createdAt == request.time
         && getAfter(/databases/$(database)/documents/users/$(uid)).data.username == request.resource.data.username;
       allow read: if admin();
       allow update: if admin() && uid != request.auth.uid
         && get(/databases/$(database)/documents/users/$(uid)).data.get('isMasterAdmin', false) != true
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role','status','updatedAt','auditLogId'])
+        && updatedAtServerTimeIfChanged()
         && linkedUserAudit(request.resource.data.auditLogId,uid)
         && request.resource.data.auditLogId == getAfter(/databases/$(database)/documents/users/$(uid)).data.auditLogId
         && (request.resource.data.role in ['admin','executive','member','guest'] || request.resource.data.role == null)
@@ -231,20 +250,23 @@ service cloud.firestore {
         && !exists(/databases/$(database)/documents/settings/masterAdmin)
         && request.resource.data.role == 'admin' && request.resource.data.status == 'approved'
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role','status','updatedAt','auditLogId'])
+        && updatedAtServerTimeIfChanged()
         && linkedAudit(request.resource.data.auditLogId,'user.master_admin_claimed','users',uid)
       allow delete: if false;
     }
 
     match /ticketTiers/{id} {
       allow read: if financeReader();
-      allow create: if admin() && workspaceAudit() && request.resource.data.sold == 0
+      allow create: if admin() && workspaceAudit() && configurationPathAudited('ticketTiers',id) && createdAtServerTimeIfPresent()
+        && (!request.resource.data.keys().hasAny(['updatedAt']) || request.resource.data.updatedAt == request.time)
+        && request.resource.data.sold == 0
         && request.resource.data.capacity is int && request.resource.data.capacity >= 0
         && validMoney(request.resource.data.price);
-      allow update: if admin() && workspaceAudit()
+      allow update: if admin() && workspaceAudit() && configurationPathAudited('ticketTiers',id) && updatedAtServerTimeIfChanged()
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['price','capacity','active','updatedAt'])
         && validMoney(request.resource.data.price)
         && request.resource.data.capacity is int && request.resource.data.capacity >= resource.data.sold;
-      allow update: if ticketAgent()
+      allow update: if ticketAgent() && updatedAtServerTimeIfChanged()
         && resource.data.sold is int && resource.data.sold >= 0
         && resource.data.capacity is int && resource.data.capacity >= resource.data.sold
         && validMoney(resource.data.price)
@@ -255,7 +277,18 @@ service cloud.firestore {
         && request.resource.data.sold is int && request.resource.data.sold >= 0
         && request.resource.data.sold == resource.data.sold + getAfter(/databases/$(database)/documents/ticketSales/$(request.resource.data.lastSaleId)).data.quantity
         && request.resource.data.sold <= resource.data.capacity;
-      allow delete: if admin() && workspaceAudit();
+      allow update: if admin() && updatedAtServerTimeIfChanged()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['sold','lastDeletedSaleId','auditLogId','updatedAt'])
+        && request.resource.data.lastDeletedSaleId is string
+        && exists(/databases/$(database)/documents/ticketSales/$(request.resource.data.lastDeletedSaleId))
+        && !existsAfter(/databases/$(database)/documents/ticketSales/$(request.resource.data.lastDeletedSaleId))
+        && get(/databases/$(database)/documents/ticketSales/$(request.resource.data.lastDeletedSaleId)).data.tierId == id
+        && request.resource.data.sold is int
+        && request.resource.data.sold == resource.data.sold - get(/databases/$(database)/documents/ticketSales/$(request.resource.data.lastDeletedSaleId)).data.quantity
+        && request.resource.data.sold >= 0
+        && request.resource.data.auditLogId == request.resource.data.lastDeletedSaleId
+        && linkedAudit(request.resource.data.auditLogId,'ticket.sale.deleted','ticketSales',request.resource.data.lastDeletedSaleId);
+      allow delete: if admin() && workspaceAudit() && configurationPathAudited('ticketTiers',id);
     }
 
     match /ticketSales/{id} {
@@ -276,7 +309,7 @@ service cloud.firestore {
         && validMoney(request.resource.data.total)
         && request.resource.data.total == request.resource.data.unitPrice * request.resource.data.quantity
         && request.resource.data.status == 'Paid' && validDate(request.resource.data.date)
-        && request.resource.data.createdAt is timestamp
+        && request.resource.data.createdAt == request.time
         && exists(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId))
         && getAfter(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.lastSaleId == id
         && getAfter(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.sold
@@ -284,7 +317,8 @@ service cloud.firestore {
         && getAfter(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.sold <= get(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.capacity
         && getAfter(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.active == true
         && request.resource.data.unitPrice == get(/databases/$(database)/documents/ticketTiers/$(request.resource.data.tierId)).data.price;
-      allow update, delete: if false;
+      allow update: if false;
+      allow delete: if admin() && linkedAudit(id,'ticket.sale.deleted','ticketSales',id);
     }
 
     match /revenues/{id} {
@@ -300,7 +334,7 @@ service cloud.firestore {
         && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date)
         && request.resource.data.method is string && request.resource.data.method.size() <= 60
         && request.resource.data.updatedBy == request.auth.uid
-        && request.resource.data.updatedAt is timestamp && request.resource.data.createdAt is timestamp;
+        && request.resource.data.updatedAt == request.time && request.resource.data.createdAt == request.time;
       allow update: if financeWriter() && (resource.data.createdBy == request.auth.uid || admin())
         && request.resource.data.createdBy == resource.data.createdBy
         && request.resource.data.updatedBy == request.auth.uid
@@ -311,7 +345,7 @@ service cloud.firestore {
         && validMoney(request.resource.data.amount) && request.resource.data.amount > 0
         && request.resource.data.status in ['Paid','Pending','Unpaid'] && validDate(request.resource.data.date)
         && request.resource.data.method is string && request.resource.data.method.size() <= 60
-        && request.resource.data.updatedAt is timestamp;
+        && request.resource.data.updatedAt == request.time;
       allow delete: if admin()
         && linkedAudit(id,'revenue.deleted','revenues',id);
     }
@@ -331,8 +365,8 @@ service cloud.firestore {
         && validMoney(request.resource.data.amount) && request.resource.data.amount > 0
         && request.resource.data.status in ['Paid','Pending','Deposit'] && validDate(request.resource.data.date)
         && request.resource.data.updatedBy == request.auth.uid
-        && request.resource.data.updatedAt is timestamp && request.resource.data.createdAt is timestamp;
-      allow update: if financeWriter() && (resource.data.createdBy == request.auth.uid || admin())
+        && request.resource.data.updatedAt == request.time && request.resource.data.createdAt == request.time;
+      allow update: if financeWriter()
         && request.resource.data.createdBy == resource.data.createdBy
         && request.resource.data.updatedBy == request.auth.uid
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['title','category','expenseCategoryId','budgetAllocationId','amount','previousAmount','status','date','updatedBy','updatedAt','auditLogId'])
@@ -351,33 +385,35 @@ service cloud.firestore {
         && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['previousAmount'])
           || (request.resource.data.diff(resource.data).affectedKeys().hasAny(['amount'])
             && request.resource.data.previousAmount is int && request.resource.data.previousAmount == resource.data.amount))
-        && request.resource.data.updatedAt is timestamp;
+        && request.resource.data.updatedAt == request.time;
       allow delete: if admin()
         && linkedAudit(id,'expense.deleted','expenses',id);
     }
 
     match /revenueCategories/{id} {
       allow read: if financeReader();
-      allow create: if admin() && workspaceAudit() && request.resource.data.name is string
+      allow create: if admin() && workspaceAudit() && configurationPathAudited('revenueCategories',id) && createdAtServerTimeIfPresent()
+        && request.resource.data.get('updatedAt',request.time) == request.time && request.resource.data.name is string
         && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60
         && request.resource.data.get('systemControlled', false) is bool
         && (request.resource.data.get('systemControlled', false) != true || (id == 'ticket-sales' && request.resource.data.name == 'Ticket Sales'));
-      allow update: if admin() && workspaceAudit() && resource.data.get('systemControlled', false) != true
+      allow update: if admin() && workspaceAudit() && configurationPathAudited('revenueCategories',id) && updatedAtServerTimeIfChanged() && resource.data.get('systemControlled', false) != true
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','active','updatedAt'])
         && request.resource.data.name is string && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60;
       allow delete: if false;
     }
     match /expenseCategories/{id} {
       allow read: if financeReader();
-      allow create: if admin() && workspaceAudit() && request.resource.data.name is string
+      allow create: if admin() && workspaceAudit() && configurationPathAudited('expenseCategories',id) && createdAtServerTimeIfPresent()
+        && request.resource.data.get('updatedAt',request.time) == request.time && request.resource.data.name is string
         && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60;
-      allow update: if admin() && workspaceAudit() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','active','updatedAt'])
+      allow update: if admin() && workspaceAudit() && configurationPathAudited('expenseCategories',id) && updatedAtServerTimeIfChanged() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','active','updatedAt'])
         && request.resource.data.name is string && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60;
       allow delete: if false;
     }
     match /budgetAllocations/{id} {
       allow read: if financeReader();
-      allow create: if admin() && workspaceAudit()
+      allow create: if admin() && workspaceAudit() && configurationPathAudited('budgetAllocations',id)
         && request.resource.data.keys().hasOnly(['budgetId','categoryId','category','percent','amount','createdAt','updatedAt'])
         && request.resource.data.budgetId == 'event-2026'
         && request.resource.data.category is string
@@ -385,8 +421,8 @@ service cloud.firestore {
         && (!request.resource.data.keys().hasAny(['categoryId']) || (request.resource.data.categoryId is string && request.resource.data.categoryId.size() <= 100))
         && request.resource.data.percent is number && request.resource.data.percent >= 0 && request.resource.data.percent <= 100
         && validMoney(request.resource.data.amount)
-        && request.resource.data.createdAt is timestamp && request.resource.data.updatedAt is timestamp;
-      allow update: if admin() && workspaceAudit()
+        && request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time;
+      allow update: if admin() && workspaceAudit() && configurationPathAudited('budgetAllocations',id)
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['budgetId','categoryId','category','percent','amount','updatedAt'])
         && request.resource.data.budgetId == 'event-2026'
         && request.resource.data.category is string
@@ -394,45 +430,65 @@ service cloud.firestore {
         && (!request.resource.data.keys().hasAny(['categoryId']) || (request.resource.data.categoryId is string && request.resource.data.categoryId.size() <= 100))
         && request.resource.data.percent is number && request.resource.data.percent >= 0 && request.resource.data.percent <= 100
         && validMoney(request.resource.data.amount)
-        && request.resource.data.updatedAt is timestamp;
-      allow delete: if admin() && workspaceAudit();
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if admin() && workspaceAudit() && configurationPathAudited('budgetAllocations',id);
     }
     match /budgets/{id} {
       allow read: if financeReader();
-      allow create: if admin() && workspaceAudit()
+      allow create: if admin() && workspaceAudit() && configurationPathAudited('budgets',id)
         && id == 'event-2026'
         && request.resource.data.keys().hasOnly(['name','totalAmount','year','createdAt','updatedAt'])
         && request.resource.data.name is string && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 100
         && validMoney(request.resource.data.totalAmount) && request.resource.data.totalAmount > 0
         && request.resource.data.year is int
-        && request.resource.data.createdAt is timestamp && request.resource.data.updatedAt is timestamp;
-      allow update: if admin() && workspaceAudit()
+        && request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time;
+      allow update: if admin() && workspaceAudit() && configurationPathAudited('budgets',id)
         && id == 'event-2026'
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','totalAmount','year','updatedAt'])
         && request.resource.data.name is string && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 100
         && validMoney(request.resource.data.totalAmount) && request.resource.data.totalAmount > 0
-        && request.resource.data.year is int && request.resource.data.updatedAt is timestamp;
+        && request.resource.data.year is int && request.resource.data.updatedAt == request.time;
     }
     match /settings/{id} {
       allow read: if admin();
-      allow create, update: if admin() && id == 'workspace'
+      allow create: if admin() && id == 'workspace'
           && request.resource.data.auditLogId is string && request.resource.data.updatedAt == request.time
           && linkedAudit(request.resource.data.auditLogId,'configuration.updated','settings','workspace')
-        || (admin() && id != 'masterAdmin' && id != 'workspace' && workspaceAudit())
+        || (admin() && id != 'masterAdmin' && id != 'workspace' && workspaceAudit() && configurationPathAudited('settings',id)
+          && createdAtServerTimeIfPresent() && request.resource.data.get('updatedAt',request.time) == request.time)
         || (id == 'masterAdmin' && signedIn() && request.auth.token.email == 'carpentersfamily001@gmail.com'
           && request.auth.token.email_verified == true && request.resource.data.uid == request.auth.uid
+          && createdAtServerTimeIfPresent()
           && !exists(/databases/$(database)/documents/settings/masterAdmin)
           && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.isMasterAdmin == true
           && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin');
+      allow update: if admin() && id == 'workspace'
+          && request.resource.data.auditLogId is string && request.resource.data.updatedAt == request.time
+          && linkedAudit(request.resource.data.auditLogId,'configuration.updated','settings','workspace')
+        || (admin() && id != 'masterAdmin' && id != 'workspace' && workspaceAudit() && configurationPathAudited('settings',id)
+          && updatedAtServerTimeIfChanged() && createdAtServerTimeIfChanged());
       allow delete: if false;
+    }
+    match /alertDismissals/{uid}/items/{alertId} {
+      allow read: if self(uid) && approved();
+      allow create, update: if self(uid) && approved()
+        && request.resource.data.keys().hasOnly(['alertId','dismissedAt'])
+        && request.resource.data.keys().hasAll(['alertId','dismissedAt'])
+        && request.resource.data.alertId is string
+        && request.resource.data.alertId == alertId
+        && request.resource.data.alertId.size() >= 1
+        && request.resource.data.alertId.size() <= 150
+        && request.resource.data.dismissedAt == request.time;
+      allow delete: if self(uid) && approved();
     }
     match /activityLogs/{id} {
       allow read: if admin();
       allow create: if signedIn() && request.resource.data.actorId == request.auth.uid
         && request.resource.data.keys().hasOnly(['actor','actorId','action','label','targetType','targetId','createdAt','previousAmount','newAmount','reason','changes','snapshot'])
-        && (!request.resource.data.keys().hasAny(['changes']) || (request.resource.data.action in ['expense.updated','revenue.updated'] && validAuditChanges(request.resource.data.changes)))
-        && (!request.resource.data.keys().hasAny(['snapshot']) || (request.resource.data.action in ['expense.deleted','revenue.deleted'] && validAuditSnapshot(request.resource.data.snapshot)))
-        && (request.resource.data.get('action','') in ['expense.deleted','revenue.deleted','user.approve','user.role','user.suspend','user.reactivate']
+        && (!request.resource.data.keys().hasAny(['changes']) || ((request.resource.data.action in ['expense.updated','revenue.updated'] && validAuditChanges(request.resource.data.changes))
+          || (request.resource.data.action == 'configuration.updated' && validConfigurationChanges(request.resource.data.changes))))
+        && (!request.resource.data.keys().hasAny(['snapshot']) || (request.resource.data.action in ['ticket.sale.deleted','expense.deleted','revenue.deleted'] && validAuditSnapshot(request.resource.data.snapshot)))
+        && (request.resource.data.get('action','') in ['ticket.sale.deleted','expense.deleted','revenue.deleted','user.approve','user.role','user.suspend','user.reactivate']
           ? validReason(request.resource.data.get('reason', null))
           : (!request.resource.data.keys().hasAny(['reason']) || validReason(request.resource.data.reason)))
         && (!request.resource.data.keys().hasAny(['previousAmount','newAmount'])
@@ -446,12 +502,13 @@ service cloud.firestore {
         && request.resource.data.label == request.resource.data.action
         && request.resource.data.targetType is string && request.resource.data.targetType.size() >= 1 && request.resource.data.targetType.size() <= 30
         && request.resource.data.targetId is string && request.resource.data.targetId.size() >= 1 && request.resource.data.targetId.size() <= 150
-        && request.resource.data.createdAt is timestamp
+        && request.resource.data.createdAt == request.time
         && ((approved() && request.resource.data.action != 'user.signup'
             && request.resource.data.action != 'user.master_admin_claimed'
             && request.resource.data.actor == profile().fullName
             && activityTargetMatches(id)
             && ((request.resource.data.action == 'ticket.sale' && profile().role in ['admin','executive','member'])
+              || (request.resource.data.action == 'ticket.sale.deleted' && profile().role == 'admin')
               || (request.resource.data.action in ['expense.created','expense.updated','expense.deleted','revenue.created','revenue.updated','revenue.deleted'] && profile().role in ['admin','executive'])
               || (request.resource.data.action in ['user.approve','user.reject','user.role','user.suspend','user.reactivate'] && profile().role == 'admin')
               || (request.resource.data.action == 'configuration.updated' && profile().role == 'admin')))

@@ -8,7 +8,7 @@ const { outputText } = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 });
 const budget = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
-const { getExpenseBudgetWarnings, summarizeAllocationExpenses, summarizeExpenses } = budget;
+const { getExpenseBudgetWarnings, getReferencedAllocationIds, summarizeAllocationExpenses, summarizeExpenses } = budget;
 
 const allocations = [{ id: 'venue', category: 'Venue', amount: 100 }];
 
@@ -47,4 +47,14 @@ test('warns when the selected expense category has no allocation', () => {
   });
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /no budget allocation matches/i);
+});
+
+test('blocks deleting allocations referenced by expenses but ignores unlinked or retained allocations', () => {
+  const expenses = [
+    { amount: 40, status: 'Paid', category: 'Venue', budgetAllocationId: 'venue' },
+    { amount: 20, status: 'Pending', category: 'Marketing', budgetAllocationId: 'marketing' },
+    { amount: 10, status: 'Paid', category: 'Transport', budgetAllocationId: null },
+  ];
+  assert.deepEqual(getReferencedAllocationIds(expenses, ['venue', 'old-allocation']), ['venue']);
+  assert.deepEqual(getReferencedAllocationIds(expenses, ['old-allocation']), []);
 });

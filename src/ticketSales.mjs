@@ -38,3 +38,35 @@ export async function recordTicketSale(db,attempt,actorName,actorId,errorForMess
     return 'recorded';
   });
 }
+
+/**
+ * Delete a ticket sale as an audited Admin operation and restore tier inventory atomically.
+ * The sale ID is used for the deletion audit ID so Firestore rules can bind the removal
+ * to the deleted document without adding a mutable audit pointer to the sale itself.
+ */
+export async function deleteTicketSale(db,saleId,reason,actorName,actorId,errorForMessage=message=>new Error(message)){
+  const normalizedReason=String(reason||'').trim();
+  if(!normalizedReason||normalizedReason.length>500){
+    throw errorForMessage('Enter a reason of 1–500 characters to delete this sale.');
+  }
+  const saleRef=doc(db,'ticketSales',saleId);
+  const auditRef=doc(db,'activityLogs',saleId);
+  return runTransaction(db,async tx=>{
+    const [saleSnap,auditSnap]=await Promise.all([tx.get(saleRef),tx.get(auditRef)]);
+    if(!saleSnap.exists())throw errorForMessage('This ticket sale no longer exists. Refresh the sales list.');
+    if(auditSnap.exists())throw errorForMessage('The sale cannot be deleted because its audit record ID is already in use. Contact the administrator.');
+    const sale=saleSnap.data();
+    const tierRef=doc(db,'ticketTiers',String(sale.tierId||''));
+    const tierSnap=await tx.get(tierRef);
+    if(tierSnap.exists()){
+      const sold=Number(tierSnap.data().sold),quantity=Number(sale.quantity);
+      if(!Number.isInteger(sold)||!Number.isInteger(quantity)||quantity<1||sold<quantity){
+        throw errorForMessage('The ticket tier count does not match this sale. Contact the administrator before deleting it.');
+      }
+      tx.update(tierRef,{sold:sold-quantity,lastDeletedSaleId:saleId,auditLogId:saleId,updatedAt:serverTimestamp()});
+    }
+    tx.delete(saleRef);
+    tx.set(auditRef,{actor:actorName,actorId,action:'ticket.sale.deleted',label:'ticket.sale.deleted',targetType:'ticketSales',targetId:saleId,createdAt:serverTimestamp(),reason:normalizedReason,snapshot:sale});
+    return {sale,tierRestored:tierSnap.exists()};
+  });
+}

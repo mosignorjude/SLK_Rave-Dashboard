@@ -76,6 +76,10 @@ Finance audit detail values are generated from transaction reads and Rules valid
 
 Budget enforcement is currently **warn only**. The Budget page counts Paid expenses and Deposit amounts as paid spending, separates Pending expenses as commitments, and keeps legacy Unpaid records as commitments. Expense saves display advisory overrun warnings. These browser warnings do not prevent spending and can be bypassed by direct Firestore writes.
 
+## Current alerts
+
+The bell opens a Spark-compatible view of current ticket inventory and budget thresholds derived from the authenticated user's permitted Firestore data. Firestore listeners update the view while the dashboard is open and connected; cached or unsynced values are labeled. This panel is not a durable notification or event-delivery service: it does not keep per-user read/unread or delete state, and it does not guarantee delivery while the app is closed or disconnected. An alert is informational and is not proof that a ticket sale, payment, approval, or other business action occurred. Verify the current business record and its status.
+
 ## Guest access
 
 Guests are authenticated Firebase users. Their profile is assigned the fixed `guest` role at signup, and Firestore Rules require a verified email before they can read authorized financial collections. Guests can view the same financial information as Members and Executives, while Firestore Rules deny Guest writes. The dashboard hides write controls for Guests as a usability measure; the Rules remain authoritative.

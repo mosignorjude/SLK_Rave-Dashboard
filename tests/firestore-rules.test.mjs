@@ -8,6 +8,7 @@ import {
   doc,
   getDoc,
   getDocs,
+  onSnapshot,
   orderBy,
   query,
   runTransaction,
@@ -18,8 +19,10 @@ import {
   where,
   writeBatch,
 } from 'firebase/firestore';
-import { recordTicketSale } from '../src/ticketSales.mjs';
+import { deleteTicketSale, recordTicketSale } from '../src/ticketSales.mjs';
 import { recordExpense } from '../src/financialWrites.mjs';
+import { currentAlertSourcesForRole, deriveCurrentAlerts } from '../src/notificationPolicy.mjs';
+import { configurationAuditChanges } from '../src/configurationChanges.mjs';
 
 const projectId = 'demo-slk-rave-rules';
 const profiles = {
@@ -72,25 +75,62 @@ function auditEntry(uid, action, targetType, targetId) {
   };
 }
 
+async function readRecord(collectionName, id) {
+  let record = null;
+  await testEnv.withSecurityRulesDisabled(async (context) => {
+    const snapshot = await getDoc(doc(context.firestore(), collectionName, id));
+    record = snapshot.exists() ? snapshot.data() : null;
+  });
+  return record;
+}
+
+function auditChanges(before, after) {
+  return { before, after };
+}
+
+function auditSnapshot(record) {
+  return record;
+}
+
 async function writeAudited(uid, collectionName, id, data, action, operation = 'set', auditId = `audit-${id}`, auditDetails = {}) {
   const db = client(uid);
   const batch = writeBatch(db);
   const target = doc(db, collectionName, id);
   const payload = { ...data, auditLogId: auditId };
+  const details = { ...auditDetails };
+  if (operation === 'update' && ['expense.updated','revenue.updated'].includes(action) && !Object.hasOwn(details, 'changes')) {
+    const before = await readRecord(collectionName, id);
+    details.changes = auditChanges(before, { ...before, ...data, auditLogId: auditId });
+  }
+  if (operation === 'delete' && ['expense.deleted','revenue.deleted'].includes(action) && !Object.hasOwn(details, 'snapshot')) {
+    details.snapshot = auditSnapshot(await readRecord(collectionName, id));
+  }
   if (operation === 'update') batch.update(target, payload);
   else if (operation === 'delete') batch.delete(target);
   else batch.set(target, payload);
-  batch.set(doc(db, 'activityLogs', auditId), { ...auditEntry(uid, action, collectionName, id), ...auditDetails });
+  batch.set(doc(db, 'activityLogs', auditId), { ...auditEntry(uid, action, collectionName, id), ...details });
   await batch.commit();
 }
 
-async function writeConfiguration(uid, writes) {
+async function writeConfiguration(uid, writes, changes = {}) {
   const db = client(uid);
   const auditId = `configuration-${Math.random().toString(36).slice(2)}`;
   const batch = writeBatch(db);
+  const paths = new Set();
+  const capturedBatch = {
+    set(ref, ...args) { paths.add(ref.path); batch.set(ref, ...args); return this; },
+    update(ref, ...args) { paths.add(ref.path); batch.update(ref, ...args); return this; },
+    delete(ref) { paths.add(ref.path); batch.delete(ref); return this; },
+  };
+  writes(capturedBatch, db);
+  const linkedChanges = { ...changes };
+  for (const path of paths) {
+    if (!Object.hasOwn(linkedChanges, path)) linkedChanges[path] = { before: null, after: { testChange: true } };
+  }
   batch.set(doc(db, 'settings', 'workspace'), { auditLogId: auditId, updatedAt: serverTimestamp() }, { merge: true });
-  batch.set(doc(db, 'activityLogs', auditId), auditEntry(uid, 'configuration.updated', 'settings', 'workspace'));
-  writes(batch, db);
+  batch.set(doc(db, 'activityLogs', auditId), {
+    ...auditEntry(uid, 'configuration.updated', 'settings', 'workspace'), changes: linkedChanges,
+  });
   await batch.commit();
 }
 
@@ -139,6 +179,27 @@ after(async () => {
   await testEnv?.cleanup();
 });
 
+test('approved users can dismiss only their own alerts', async () => {
+  const memberDb = client('member');
+  const ownAlert = doc(memberDb, 'alertDismissals', 'member', 'items', 'budget-75');
+  await assertSucceeds(setDoc(ownAlert, { alertId: 'budget-75', dismissedAt: serverTimestamp() }));
+  await assertSucceeds(setDoc(ownAlert, { alertId: 'budget-75', dismissedAt: serverTimestamp() }));
+  await assertSucceeds(getDoc(ownAlert));
+  assert.equal((await assertSucceeds(getDocs(collection(memberDb, 'alertDismissals', 'member', 'items')))).size, 1);
+  await assertSucceeds(deleteDoc(ownAlert));
+
+  const anotherUsersAlert = doc(memberDb, 'alertDismissals', 'executive', 'items', 'budget-90');
+  await assertFails(setDoc(anotherUsersAlert, { alertId: 'budget-90', dismissedAt: serverTimestamp() }));
+  await assertFails(getDoc(anotherUsersAlert));
+  await assertFails(deleteDoc(anotherUsersAlert));
+  await assertFails(setDoc(doc(memberDb, 'alertDismissals', 'member', 'items', 'wrong-id'), {
+    alertId: 'different-id', dismissedAt: serverTimestamp(),
+  }));
+  await assertFails(setDoc(doc(client('pending'), 'alertDismissals', 'pending', 'items', 'budget-75'), {
+    alertId: 'budget-75', dismissedAt: serverTimestamp(),
+  }));
+});
+
 test('Guests, Members, Executives, and Admins share finance reads and full ticket-sale lists', async () => {
   for (const uid of ['admin', 'executive', 'member', 'guest']) {
     await assertSucceeds(getDoc(doc(client(uid), 'expenses', 'existing')));
@@ -148,6 +209,60 @@ test('Guests, Members, Executives, and Admins share finance reads and full ticke
   for (const uid of ['pending', 'rejected', 'suspended']) {
     await assertFails(getDoc(doc(client(uid), 'expenses', 'existing')));
     await assertFails(getDocs(collection(client(uid), 'ticketSales')));
+  }
+});
+
+test('an active profile listener switches alert access as the trusted role changes', async () => {
+  const profileRef = doc(client('guest'), 'users', 'guest');
+  const currentData = {
+    budgetTotal: 100_000,
+    paidAndDepositSpend: 90_000,
+    committedSpend: 10_000,
+    tiers: [{ id: 'regular', name: 'Regular', capacity: 100, sold: 95 }],
+  };
+  const waiters = [];
+  const waitForRole = expected => new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`Timed out waiting for the ${expected} profile snapshot`)), 10_000);
+    waiters.push({ expected, resolve: role => { clearTimeout(timeout); resolve(role); } });
+  });
+  const stop = onSnapshot(profileRef, { includeMetadataChanges: true }, snapshot => {
+    if (snapshot.metadata.fromCache || !snapshot.exists()) return;
+    const role = snapshot.data().role;
+    const waiterIndex = waiters.findIndex(waiter => waiter.expected === role);
+    if (waiterIndex >= 0) waiters.splice(waiterIndex, 1)[0].resolve(role);
+  });
+
+  try {
+    let nextRole = waitForRole('guest');
+    assert.equal(await nextRole, 'guest');
+    assert.deepEqual(currentAlertSourcesForRole('guest'), ['tickets']);
+    assert.ok(deriveCurrentAlerts({ ...currentData, role: 'guest' }).every(alert => alert.category === 'tickets'));
+
+    nextRole = waitForRole('member');
+    await testEnv.withSecurityRulesDisabled(async context => {
+      const adminDb = context.firestore();
+      await Promise.all([
+        setDoc(doc(adminDb, 'users', 'guest'), { ...profiles.guest, role: 'member' }),
+        setDoc(doc(adminDb, 'usersPublic', 'guest'), { ...profiles.guest, role: 'member' }),
+      ]);
+    });
+    assert.equal(await nextRole, 'member');
+    assert.ok(currentAlertSourcesForRole('member').includes('expenses'));
+    assert.ok(deriveCurrentAlerts({ ...currentData, role: 'member' }).some(alert => alert.category === 'finance'));
+
+    nextRole = waitForRole('guest');
+    await testEnv.withSecurityRulesDisabled(async context => {
+      const adminDb = context.firestore();
+      await Promise.all([
+        setDoc(doc(adminDb, 'users', 'guest'), profiles.guest),
+        setDoc(doc(adminDb, 'usersPublic', 'guest'), profiles.guest),
+      ]);
+    });
+    assert.equal(await nextRole, 'guest');
+    assert.deepEqual(currentAlertSourcesForRole('guest'), ['tickets']);
+    assert.ok(deriveCurrentAlerts({ ...currentData, role: 'guest' }).every(alert => alert.category === 'tickets'));
+  } finally {
+    stop();
   }
 });
 
@@ -299,6 +414,31 @@ test('ticket sale retries reuse the original sale and audit IDs without incremen
   });
   await assertSucceeds(getDoc(doc(db, 'ticketSales', 'another-agents-sale')));
   await assertFails(getDoc(doc(db, 'activityLogs', attempt.auditId)));
+});
+
+test('only Admins can delete ticket sales, with a required audit reason and restored inventory', async () => {
+  const adminDb = client('admin');
+  await testEnv.withSecurityRulesDisabled(async context => {
+    await updateDoc(doc(context.firestore(), 'ticketTiers', 'regular'), { sold: 1 });
+  });
+  const attempt = { saleId: 'sale-to-delete', auditId: 'sale-to-delete-audit', tierId: 'regular', quantity: 1, date: '2026-09-27', quotedUnitPrice: 8000 };
+  await recordTicketSale(client('member'), attempt, profiles.member.fullName, 'member');
+
+  await assertFails(deleteTicketSale(client('executive'), attempt.saleId, 'Remove duplicate', profiles.executive.fullName, 'executive'));
+  await assert.rejects(deleteTicketSale(adminDb, attempt.saleId, '   ', profiles.admin.fullName, 'admin'), /reason/i);
+
+  const result = await assertSucceeds(deleteTicketSale(adminDb, attempt.saleId, 'Duplicate sale entry', profiles.admin.fullName, 'admin'));
+  const [sale, tier, audit] = await Promise.all([
+    getDoc(doc(adminDb, 'ticketSales', attempt.saleId)),
+    getDoc(doc(adminDb, 'ticketTiers', 'regular')),
+    getDoc(doc(adminDb, 'activityLogs', attempt.saleId)),
+  ]);
+  assert.equal(result.tierRestored, true);
+  assert.equal(sale.exists(), false);
+  assert.equal(tier.data().sold, 1);
+  assert.equal(audit.data().action, 'ticket.sale.deleted');
+  assert.equal(audit.data().reason, 'Duplicate sale entry');
+  assert.equal(audit.data().snapshot.total, 8000);
 });
 
 test('concurrent ticket sales cannot oversell the final ticket', async () => {
@@ -479,6 +619,38 @@ test('category and ticket-tier configuration writes require a same-batch workspa
   await writeConfiguration('admin', (batch, configDb) => batch.delete(doc(configDb, 'budgetAllocations', 'audited-delete')));
 });
 
+test('configuration audit details capture field changes for budgets, allocations, categories, and ticket tiers', async () => {
+  const db = client('admin');
+  const changes = configurationAuditChanges([
+    { path: 'budgets/event-2026', before: { name: 'SLK Rave 2026', totalAmount: 1000000, year: 2026 }, after: { name: 'SLK Rave 2026', totalAmount: 1200000, year: 2026 } },
+    { path: 'budgetAllocations/venue', before: null, after: { budgetId: 'event-2026', category: 'Venue', percent: 40, amount: 480000 } },
+    { path: 'expenseCategories/production', before: { name: 'Production', active: true }, after: { name: 'Venue & Production', active: true } },
+    { path: 'ticketTiers/regular', before: { price: 8000, capacity: 540 }, after: { price: 9000, capacity: 540 } },
+    { path: 'expenseCategories/unchanged', before: { name: 'Same', active: true }, after: { name: 'Same', active: true } },
+    { path: 'budgetAllocations/removed', before: { category: 'Old', amount: 100 }, after: null },
+  ]);
+  assert.deepEqual(changes, {
+    'budgets/event-2026': { before: { name: 'SLK Rave 2026', totalAmount: 1000000, year: 2026 }, after: { name: 'SLK Rave 2026', totalAmount: 1200000, year: 2026 } },
+    'budgetAllocations/venue': { before: null, after: { budgetId: 'event-2026', category: 'Venue', percent: 40, amount: 480000 } },
+    'expenseCategories/production': { before: { name: 'Production', active: true }, after: { name: 'Venue & Production', active: true } },
+    'ticketTiers/regular': { before: { price: 8000, capacity: 540 }, after: { price: 9000, capacity: 540 } },
+    'budgetAllocations/removed': { before: { category: 'Old', amount: 100 }, after: null },
+  });
+
+  const persistedChanges = configurationAuditChanges([
+    { path: 'expenseCategories/production', before: null, after: { name: 'Venue & Production', active: true } },
+    { path: 'ticketTiers/regular', before: { price: 8000, capacity: 540 }, after: { price: 9000, capacity: 540 } },
+  ]);
+  await writeConfiguration('admin', (batch, configDb) => {
+    batch.set(doc(configDb, 'expenseCategories', 'production'), { name: 'Venue & Production', active: true });
+    batch.update(doc(configDb, 'ticketTiers', 'regular'), { price: 9000, updatedAt: serverTimestamp() });
+  }, persistedChanges);
+  const logs = await getDocs(query(collection(db, 'activityLogs'), where('action', '==', 'configuration.updated')));
+  assert.equal(logs.size, 1);
+  assert.deepEqual(logs.docs[0].data().changes, persistedChanges);
+  assert.deepEqual(logs.docs[0].data().changes['expenseCategories/production'].before, null);
+});
+
 test('configuration writes reject stale workspace markers and mismatched audit events', async () => {
   const db = client('admin');
   await writeConfiguration('admin', (batch, configDb) => batch.set(doc(configDb, 'expenseCategories', 'initial-config'), { name: 'Initial' }));
@@ -490,6 +662,21 @@ test('configuration writes reject stale workspace markers and mismatched audit e
   batch.set(doc(db, 'activityLogs', 'wrong-config-event'), auditEntry('admin', 'expense.created', 'expenses', 'unrelated'));
   batch.set(doc(db, 'expenseCategories', 'mismatched-event'), { name: 'Mismatched event' });
   await assertFails(batch.commit());
+
+  const wrongPath = writeBatch(db);
+  wrongPath.set(doc(db, 'settings', 'workspace'), { auditLogId: 'wrong-config-path', updatedAt: serverTimestamp() }, { merge: true });
+  wrongPath.set(doc(db, 'activityLogs', 'wrong-config-path'), {
+    ...auditEntry('admin', 'configuration.updated', 'settings', 'workspace'),
+    changes: { 'expenseCategories/another-category': { before: null, after: { name: 'Wrong target' } } },
+  });
+  wrongPath.set(doc(db, 'expenseCategories', 'unlisted-category'), { name: 'Unlisted category' });
+  await assertFails(wrongPath.commit());
+
+  const missingChanges = writeBatch(db);
+  missingChanges.set(doc(db, 'settings', 'workspace'), { auditLogId: 'missing-config-changes', updatedAt: serverTimestamp() }, { merge: true });
+  missingChanges.set(doc(db, 'activityLogs', 'missing-config-changes'), auditEntry('admin', 'configuration.updated', 'settings', 'workspace'));
+  missingChanges.set(doc(db, 'expenseCategories', 'missing-audit-entry'), { name: 'Missing audit entry' });
+  await assertFails(missingChanges.commit());
 });
 
 test('concurrent configuration batches retain both writes and audit events', async () => {
@@ -585,8 +772,19 @@ test('finance roles can edit expenses without changing creator or payment method
   }, 'expense.updated', 'update', undefined, { previousAmount: 15000, newAmount: 16000 });
 });
 
+test('executives can edit expenses created by another finance user', async () => {
+  await writeAudited('admin', 'expenses', 'admin-owned-expense', {
+    ...validExpense('admin'), budgetAllocationId: 'expense-venue',
+  }, 'expense.created');
+
+  await writeAudited('executive', 'expenses', 'admin-owned-expense', {
+    title: 'Executive corrected expense', updatedBy: 'executive', updatedAt: serverTimestamp(),
+  }, 'expense.updated', 'update', 'executive-edit-admin-owned-expense');
+});
+
 test('expense amount corrections require matching old and new amounts in the append-only audit event', async () => {
   const db = client('executive');
+  const before = await readRecord('expenses', 'existing');
   const corrected = writeBatch(db);
   corrected.update(doc(db, 'expenses', 'existing'), {
     amount: 20000, previousAmount: 15000, updatedBy: 'executive',
@@ -594,6 +792,7 @@ test('expense amount corrections require matching old and new amounts in the app
   });
   corrected.set(doc(db, 'activityLogs', 'expense-amount-corrected'), {
     ...auditEntry('executive', 'expense.updated', 'expenses', 'existing'),
+    changes: auditChanges(before, { ...before, amount: 20000, previousAmount: 15000, updatedBy: 'executive', updatedAt: serverTimestamp(), auditLogId: 'expense-amount-corrected' }),
     previousAmount: 15000, newAmount: 20000,
   });
   await assertSucceeds(corrected.commit());
@@ -605,6 +804,7 @@ test('expense amount corrections require matching old and new amounts in the app
   });
   invalid.set(doc(db, 'activityLogs', 'expense-amount-invalid'), {
     ...auditEntry('executive', 'expense.updated', 'expenses', 'existing'),
+    changes: auditChanges(before, { ...before, amount: 21000, previousAmount: 19000, updatedBy: 'executive', updatedAt: serverTimestamp(), auditLogId: 'expense-amount-invalid' }),
     previousAmount: 19000, newAmount: 21000,
   });
   await assertFails(invalid.commit());
@@ -622,15 +822,55 @@ test('legacy revenue records require matching audit events for edits and deletes
   await writeAudited('admin', 'revenues', 'sample', {}, 'revenue.deleted', 'delete', 'sample');
 });
 
+test('Admin can edit another user’s revenue without changing its creator or agent attribution', async () => {
+  const previous = await readRecord('revenues', 'sample');
+  await writeAudited('admin', 'revenues', 'sample', {
+    title: 'Admin corrected sponsor payment',
+    updatedBy: 'admin', updatedAt: serverTimestamp(),
+  }, 'revenue.updated', 'update', 'admin-revenue-edit');
+
+  const updated = await readRecord('revenues', 'sample');
+  assert.equal(updated.title, 'Admin corrected sponsor payment');
+  assert.equal(updated.createdBy, previous.createdBy);
+  assert.equal(updated.agent, previous.agent);
+  assert.equal(updated.updatedBy, 'admin');
+});
+
+test('Rules reject client-selected timestamps for audit and configuration writes', async () => {
+  const oldTimestamp = Timestamp.fromDate(new Date('2000-01-01T00:00:00.000Z'));
+  await assertFails(writeAudited('executive', 'revenues', 'client-time-revenue', {
+    title: 'Forged timestamp revenue', category: 'Sponsorships', amount: 1000,
+    status: 'Paid', date: '2026-09-30', method: 'Other', agent: profiles.executive.fullName,
+    createdBy: 'executive', updatedBy: 'executive', createdAt: oldTimestamp, updatedAt: oldTimestamp,
+  }, 'revenue.created', 'set', 'client-time-revenue'));
+  await assertFails(writeAudited('executive', 'expenses', 'existing', {
+    title: 'Client time edit', updatedBy: 'executive', updatedAt: oldTimestamp,
+  }, 'expense.updated', 'update', 'client-time-expense'));
+  await assertFails(writeConfiguration('admin', (batch, db) => batch.set(doc(db, 'ticketTiers', 'client-time-tier'), {
+    price: 1000, capacity: 1, sold: 0, createdAt: oldTimestamp, updatedAt: oldTimestamp,
+  })));
+
+  const db = client('admin');
+  const batch = writeBatch(db);
+  batch.set(doc(db, 'settings', 'workspace'), { auditLogId: 'client-time-audit', updatedAt: serverTimestamp() }, { merge: true });
+  batch.set(doc(db, 'activityLogs', 'client-time-audit'), {
+    ...auditEntry('admin', 'configuration.updated', 'settings', 'workspace'), createdAt: oldTimestamp,
+  });
+  batch.set(doc(db, 'expenseCategories', 'client-time-category'), { name: 'Client time category' });
+  await assertFails(batch.commit());
+});
+
 test('sensitive finance edits and deletions require a bounded reason in the atomic audit event', async () => {
   const db = client('admin');
   async function statusChange(collectionName, id, includeReason) {
     const batch = writeBatch(db);
     const auditId = 'status-' + collectionName + '-' + (includeReason ? 'with' : 'without') + '-reason';
+    const before = await readRecord(collectionName, id);
     batch.update(doc(db, collectionName, id), {
       status: 'Pending', updatedBy: 'admin', updatedAt: serverTimestamp(), auditLogId: auditId,
     });
     const event = auditEntry('admin', (collectionName === 'expenses' ? 'expense' : 'revenue') + '.updated', collectionName, id);
+    event.changes = auditChanges(before, { ...before, status: 'Pending', updatedBy: 'admin', updatedAt: serverTimestamp(), auditLogId: auditId });
     if (!includeReason) delete event.reason;
     batch.set(doc(db, 'activityLogs', auditId), event);
     return batch.commit();
@@ -642,9 +882,11 @@ test('sensitive finance edits and deletions require a bounded reason in the atom
 
   async function deleteWithReason(collectionName, id, includeReason) {
     const batch = writeBatch(db);
+    const snapshot = auditSnapshot(await readRecord(collectionName, id));
     batch.delete(doc(db, collectionName, id));
     const type = collectionName === 'expenses' ? 'expense' : 'revenue';
     const event = auditEntry('admin', type + '.deleted', collectionName, id);
+    event.snapshot = snapshot;
     if (!includeReason) delete event.reason;
     batch.set(doc(db, 'activityLogs', id), event);
     return batch.commit();
@@ -668,26 +910,43 @@ test('only Admins can run filtered queries against the complete audit collection
   await assertFails(getDocs(query(collection(anonymous(), 'activityLogs'), where('actorId', '==', 'executive'), where('targetType', '==', 'expenses'), orderBy('createdAt', 'desc'))));
 });
 
-test('finance audit details use the allowlisted activity payload fields', async () => {
-  await writeAudited('admin', 'revenues', 'sample', {}, 'revenue.deleted', 'delete', 'sample', {
-    reason: 'Duplicate entry', snapshot: { title: 'Sponsor payment', category: 'Sponsorships', amount: 50000, status: 'Paid', date: '2026-09-27', method: 'Bank transfer' },
-  });
+test('finance audit details use complete, record-matching payloads', async () => {
+  const revenueSnapshot = auditSnapshot(await readRecord('revenues', 'sample'));
+  const expenseBefore = await readRecord('expenses', 'existing');
+  const expenseAfter = { ...expenseBefore, title: 'Updated lighting deposit', updatedBy: 'executive', updatedAt: serverTimestamp(), auditLogId: 'expense-fabricated-change' };
+  await assertFails(writeAudited('executive', 'expenses', 'existing', {
+    title: 'Updated lighting deposit', updatedBy: 'executive', updatedAt: serverTimestamp(),
+  }, 'expense.updated', 'update', 'expense-fabricated-change', {
+    changes: { before: expenseBefore, after: { ...expenseAfter, title: 'Fabricated title' } },
+  }));
+  await assertFails(writeAudited('executive', 'expenses', 'existing', {
+    title: 'Updated lighting deposit', updatedBy: 'executive', updatedAt: serverTimestamp(),
+  }, 'expense.updated', 'update', 'expense-incomplete-change', {
+    changes: { before: expenseBefore, after: { title: 'Updated lighting deposit' } },
+  }));
 
   await assertFails(writeAudited('admin', 'revenues', 'sample', {}, 'revenue.deleted', 'delete', 'revenue-unsafe-snapshot', {
-    reason: 'Duplicate entry', snapshot: { title: 'Sponsor payment' }, privatePayload: 'private@example.test',
+    reason: 'Duplicate entry', snapshot: { title: 'Sponsor payment' },
+  }));
+  await assertFails(writeAudited('admin', 'revenues', 'sample', {}, 'revenue.deleted', 'delete', 'revenue-fabricated-snapshot', {
+    reason: 'Duplicate entry', snapshot: { ...revenueSnapshot, amount: 1 },
+  }));
+  await assertFails(writeAudited('admin', 'revenues', 'sample', {}, 'revenue.deleted', 'delete', 'revenue-private-payload', {
+    reason: 'Duplicate entry', snapshot: revenueSnapshot, privatePayload: 'private@example.test',
   }));
 
   await writeAudited('executive', 'expenses', 'existing', {
     title: 'Updated lighting deposit', updatedBy: 'executive', updatedAt: serverTimestamp(),
-  }, 'expense.updated', 'update', 'expense-safe-changes', {
-    changes: { title: { before: { present: true, value: 'Stage lighting deposit' }, after: { present: true, value: 'Updated lighting deposit' } } },
-  });
+  }, 'expense.updated', 'update', 'expense-safe-changes');
 
   await assertFails(writeAudited('executive', 'revenues', 'sample', {
     title: 'Updated sponsor payment', updatedBy: 'executive', updatedAt: serverTimestamp(),
   }, 'revenue.updated', 'update', 'revenue-unsafe-changes', {
-    changes: { title: { before: { present: true, value: 'Sponsor payment' }, after: { present: true, value: 'Updated sponsor payment' } } }, privatePayload: 'private@example.test',
+    privatePayload: 'private@example.test',
   }));
+  await writeAudited('admin', 'revenues', 'sample', {}, 'revenue.deleted', 'delete', 'sample', {
+    reason: 'Duplicate entry', snapshot: revenueSnapshot,
+  });
 });
 
 test('role grants and access changes reject missing or whitespace-only reasons', async () => {
@@ -900,32 +1159,53 @@ test('only one concurrent Master Admin bootstrap can create the marker', async (
 
 test('expense update and delete audit events must match the same atomic operation', async () => {
   const db = client('executive');
-  const updateBatch = writeBatch(db);
-  updateBatch.update(doc(db, 'expenses', 'existing'), {
-    title: 'Audited expense update', updatedBy: 'executive', updatedAt: serverTimestamp(), auditLogId: 'expense-updated',
-  });
-  updateBatch.set(doc(db, 'activityLogs', 'expense-updated'), {
-    actor: profiles.executive.fullName, actorId: 'executive', action: 'expense.updated',
-    label: 'expense.updated', targetType: 'expenses', targetId: 'existing', createdAt: serverTimestamp(),
-  });
-  await assertSucceeds(updateBatch.commit());
+  const expenseRef = doc(db, 'expenses', 'existing');
+  await assertSucceeds(runTransaction(db, async transaction => {
+    const snapshot = await transaction.get(expenseRef);
+    const before = snapshot.data();
+    const auditId = 'expense-updated';
+    const payload = {
+      title: before.title,
+      category: before.category,
+      budgetAllocationId: before.budgetAllocationId ?? null,
+      amount: 20000,
+      status: before.status,
+      date: before.date,
+      updatedBy: 'executive',
+      updatedAt: serverTimestamp(),
+    };
+    const after = { ...before, ...payload, previousAmount: before.amount, auditLogId: auditId };
+    transaction.update(expenseRef, { ...payload, previousAmount: before.amount, auditLogId: auditId });
+    transaction.set(doc(db, 'activityLogs', auditId), {
+      actor: profiles.executive.fullName, actorId: 'executive', action: 'expense.updated',
+      label: 'expense.updated', targetType: 'expenses', targetId: 'existing', createdAt: serverTimestamp(),
+      reason: 'Corrected the recorded amount', previousAmount: before.amount, newAmount: payload.amount,
+      changes: auditChanges(before, after),
+    });
+  }));
 
-  const deleteBatch = writeBatch(db);
-  deleteBatch.delete(doc(db, 'expenses', 'existing'));
-  deleteBatch.set(doc(db, 'activityLogs', 'existing'), {
-    actor: profiles.executive.fullName, actorId: 'executive', action: 'expense.deleted',
-    label: 'expense.deleted', targetType: 'expenses', targetId: 'existing', createdAt: serverTimestamp(),
-  });
-  await assertFails(deleteBatch.commit());
+  const deleteAsExecutive = doc(db, 'expenses', 'existing');
+  await assertFails(runTransaction(db, async transaction => {
+    const snapshot = await transaction.get(deleteAsExecutive);
+    transaction.delete(deleteAsExecutive);
+    transaction.set(doc(db, 'activityLogs', 'existing'), {
+      actor: profiles.executive.fullName, actorId: 'executive', action: 'expense.deleted',
+      label: 'expense.deleted', targetType: 'expenses', targetId: 'existing', createdAt: serverTimestamp(),
+      reason: 'Remove a duplicate', snapshot: snapshot.data(),
+    });
+  }));
 
   const adminDb = client('admin');
-  const adminDeleteBatch = writeBatch(adminDb);
-  adminDeleteBatch.delete(doc(adminDb, 'expenses', 'existing'));
-  adminDeleteBatch.set(doc(adminDb, 'activityLogs', 'existing'), {
-    actor: profiles.admin.fullName, actorId: 'admin', action: 'expense.deleted',
-    label: 'expense.deleted', targetType: 'expenses', targetId: 'existing', createdAt: serverTimestamp(), reason: 'Duplicate entry',
-  });
-  await assertSucceeds(adminDeleteBatch.commit());
+  const adminExpenseRef = doc(adminDb, 'expenses', 'existing');
+  await assertSucceeds(runTransaction(adminDb, async transaction => {
+    const snapshot = await transaction.get(adminExpenseRef);
+    transaction.delete(adminExpenseRef);
+    transaction.set(doc(adminDb, 'activityLogs', 'existing'), {
+      actor: profiles.admin.fullName, actorId: 'admin', action: 'expense.deleted',
+      label: 'expense.deleted', targetType: 'expenses', targetId: 'existing', createdAt: serverTimestamp(),
+      reason: 'Remove a duplicate', snapshot: auditSnapshot(snapshot.data()),
+    });
+  }));
 });
 
 test('user role audit events require matching profile changes in the same batch', async () => {

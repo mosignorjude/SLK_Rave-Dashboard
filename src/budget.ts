@@ -22,6 +22,13 @@ export function summarizeAllocationExpenses(expenses: BudgetExpense[], allocatio
   return summarizeExpenses(matching);
 }
 
+export function getReferencedAllocationIds(expenses: BudgetExpense[], allocationIds: string[]) {
+  const candidates = new Set(allocationIds);
+  return [...new Set(expenses
+    .map(expense => expense.budgetAllocationId)
+    .filter((id): id is string => typeof id === 'string' && candidates.has(id)))];
+}
+
 export function getExpenseBudgetWarnings(
   expenses: BudgetExpense[],
   allocations: Array<{ id: string; category: string; amount: number }>,

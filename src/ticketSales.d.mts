@@ -18,3 +18,12 @@ export function recordTicketSale(
   actorId:string,
   errorForMessage?:(message:string)=>Error,
 ):Promise<TicketSaleResult>;
+
+export function deleteTicketSale(
+  db:Firestore,
+  saleId:string,
+  reason:string,
+  actorName:string,
+  actorId:string,
+  errorForMessage?:(message:string)=>Error,
+):Promise<{sale:Record<string,unknown>;tierRestored:boolean}>;
